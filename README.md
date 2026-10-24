@@ -18,6 +18,25 @@ AnimeHub.Bot never returns iframe/player pages. It only returns records classifi
 - `GET /v1/sources`
 - `GET /health`
 
+## Multi-work jobs
+
+Submit several films or series in one request:
+
+```json
+POST /v1/jobs
+{
+  "concurrency": 4,
+  "items": [
+    {"title": "Your Name", "type": "film", "mode": "download", "quality": "720p"},
+    {"title": "Naruto", "type": "series", "start_episode": 1, "end_episode": 12, "mode": "links", "quality": "1080p"}
+  ]
+}
+```
+
+Poll `GET /v1/jobs/{job_id}` for progress. `mode=links` returns direct URLs; `mode=download` returns the same direct URLs for the client application to download to the phone. The server does not proxy or store third-party media. Use `POST /v1/jobs/{job_id}/cancel` to stop a running job.
+
+For production on Railway/Render, use **PostgreSQL** for jobs, work metadata, link history, and deduplication, plus **Redis** for the queue and concurrency control. Do not store video binaries in PostgreSQL. If authorized media must be cached, use an S3-compatible object store and keep only object keys and expiry metadata in PostgreSQL. The current local job manager is intentionally lightweight and in-memory; the next production step is swapping it for Redis/PostgreSQL persistence.
+
 ## Providers
 
 The current enabled adapter uses the Anime Witcher catalog and its Firebase/Algolia data. Anime Slayer v1.5.10 was identified as using `https://anslayer.com/anime/public/` plus an internal resolver; it is listed in the source catalog but is not enabled until an authorized API contract or credentials are provided. This avoids returning player pages or attempting to bypass provider protections. A new adapter can be added without changing the public API.

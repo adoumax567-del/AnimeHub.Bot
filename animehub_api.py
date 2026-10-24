@@ -7,10 +7,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from data_manager import DataManager
 from anime_slayer_provider import AnimeSlayerProvider
+from job_manager import JobManager
 
 SERVICE_NAME = "AnimeHub.Bot"
 DATA = DataManager()
 SLAYER = AnimeSlayerProvider()
+JOBS = JobManager()
 
 
 def direct_downloads(records):
@@ -177,3 +179,67 @@ async def batch_links(q: str = Query(..., min_length=1, max_length=200), start: 
     return {"service": SERVICE_NAME, "work": target.get("name"), "direct_only": True,
             "downloadable_only": True, "start": start, "limit": limit, "total_episodes": len(episodes),
             "filters": {"quality": quality, "language": language}, "episodes": pages}
+
+
+def expand_plan_item(item):
+    kind = str(item.get("type", "auto")).lower()
+    if kind == "film":
+        return [1]
+    if isinstance(item.get("episodes"), list) and item["episodes"]:
+        return [int(x) for x in item["episodes"]]
+    start = int(item.get("start_episode", 1))
+    end = int(item.get("end_episode", start))
+    if end < start or end - start > 100:
+        raise ValueError("Each series item must contain a range of at most 100 episodes")
+    return list(range(start, end + 1))
+
+
+async def resolve_plan_item(item):
+    title = str(item.get("title", "")).strip()
+    if not title:
+        raise ValueError("title is required")
+    quality = item.get("quality")
+    language = item.get("language")
+    episode_numbers = expand_plan_item(item)
+    results = []
+    for number in episode_numbers:
+        target, selected, records, _ = await asyncio.to_thread(resolve_work_episode, title, number)
+        records = select_links(records, quality, language)
+        results.append({"work": target.get("name"), "episode": selected.get("order"),
+                        "episode_name": selected.get("name"), "links": [public_link(r) for r in records]})
+    return {"mode": item.get("mode", "links"), "requested_title": title, "episodes": results,
+            "direct_only": True, "downloadable_only": True}
+
+
+@app.post("/v1/jobs")
+async def create_job(payload: dict):
+    plan = payload.get("items") or payload.get("list")
+    if not isinstance(plan, list) or not plan:
+        raise HTTPException(422, "items must be a non-empty list")
+    try:
+        for item in plan:
+            expand_plan_item(item)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc))
+    concurrency = int(payload.get("concurrency", 4))
+    job = await JOBS.create(plan, resolve_plan_item, concurrency)
+    return {"job_id": job["id"], "status": job["status"], "total": job["total"],
+            "concurrency": max(1, min(concurrency, 8)),
+            "mode": "client_download" if any(i.get("mode") == "download" for i in plan) else "links",
+            "message": "Use GET /v1/jobs/{job_id} to follow progress"}
+
+
+@app.get("/v1/jobs/{job_id}")
+async def get_job(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
+@app.post("/v1/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    if not JOBS.get(job_id):
+        raise HTTPException(404, "Job not found")
+    cancelled = await JOBS.cancel(job_id)
+    return {"job_id": job_id, "cancelled": cancelled}
