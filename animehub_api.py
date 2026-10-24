@@ -4,9 +4,11 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query
 from data_manager import DataManager
+from anime_slayer_provider import AnimeSlayerProvider
 
 SERVICE_NAME = "AnimeHub.Bot"
 DATA = DataManager()
+SLAYER = AnimeSlayerProvider()
 
 
 def direct_downloads(records):
@@ -65,7 +67,7 @@ async def sources():
         "direct_only": True,
         "enabled": {
             "anime_witcher": True,
-            "anime_slayer": os.getenv("ANIMESLAYER_ENABLED", "false").lower() == "true",
+            "anime_slayer": SLAYER.enabled and bool(SLAYER.endpoint),
         },
         "sources": catalog,
     }
@@ -98,8 +100,14 @@ async def links(
     selected = next((e for e in episodes if e.get("order") == episode_number), None)
     if not selected:
         raise HTTPException(404, "Episode not found")
-    records = await asyncio.to_thread(DATA.get_servers, target["doc_ref"], selected["id"])
-    links_only = direct_downloads(records)
+    witcher_task = asyncio.to_thread(DATA.get_servers, target["doc_ref"], selected["id"])
+    slayer_task = asyncio.to_thread(SLAYER.fetch, target.get("name"), selected.get("order", episode_number))
+    witcher_records, slayer_records = await asyncio.gather(witcher_task, slayer_task)
+    links_only = direct_downloads(witcher_records) + direct_downloads(slayer_records)
+    unique = {}
+    for record in links_only:
+        unique[(record.get("download_url"), record.get("quality"), record.get("name"))] = record
+    links_only = list(unique.values())
     return {
         "service": SERVICE_NAME,
         "query": q,
