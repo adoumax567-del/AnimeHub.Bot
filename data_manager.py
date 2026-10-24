@@ -316,11 +316,17 @@ class DataManager:
             if not doc_ref:
                 doc_ref = f"anime_list/{oid}"
             source = self.ANIME_INDEX_SOURCES.get(h.get("_source_index"), "Algolia")
+            details = h.get("details") if isinstance(h.get("details"), dict) else {}
+            aliases = []
+            for alias in (h.get("english_title"), h.get("title"), details.get("english_title"), details.get("title")):
+                if isinstance(alias, str) and alias.strip() and alias.strip().lower() != str(name).strip().lower():
+                    aliases.append(alias.strip())
             if oid not in unique:
                 unique[oid] = {
                     "name": name,
                     "doc_ref": doc_ref,
                     "poster": h.get("poster") or h.get("image") or h.get("cover"),
+                    "aliases": aliases,
                     "sources": [source],
                 }
             elif source not in unique[oid]["sources"]:
@@ -332,17 +338,22 @@ class DataManager:
         query_lower = query.lower()
         norm_query_lower = norm_query.lower()
 
+        def compact(value):
+            return re.sub(r"[^\w]+", "", str(value or "").lower(), flags=re.UNICODE)
+
         def get_smart_score(item):
             item_name = item["name"].lower()
             norm_item_name = item_name.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا').replace('ة', 'ه').replace('ى', 'ي')
-            
+            candidates = [item_name, norm_item_name] + [str(a).lower() for a in item.get("aliases", [])]
+            compact_query = compact(query_lower)
+            if any(compact_query and compact_query == compact(candidate) for candidate in candidates):
+                return 1200
             if query_lower == item_name or norm_query_lower == norm_item_name:
                 return 1000
-            if query_lower in item_name or norm_query_lower in norm_item_name:
+            if any(query_lower in candidate or norm_query_lower in candidate for candidate in candidates):
                 return 500
-            
-            score = fuzz.token_set_ratio(query_lower, item_name)
-            if item_name.startswith(query_lower) or norm_item_name.startswith(norm_query_lower):
+            score = max(fuzz.token_set_ratio(query_lower, candidate) for candidate in candidates)
+            if any(candidate.startswith(query_lower) or candidate.startswith(norm_query_lower) for candidate in candidates):
                 score += 100
             return score
 
@@ -355,6 +366,9 @@ class DataManager:
             # recap, movie, or season entries when the query is an exact title.
             if ref_key == query_key:
                 score += 2000
+            # English aliases such as Your Name -> Kimi no Na wa. are canonical.
+            if any(compact(query_lower) == compact(alias) for alias in item.get("aliases", [])):
+                score += 1800
             if "live action" in ref_key and "live action" not in query_key:
                 score -= 500
             return score
