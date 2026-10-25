@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: animehub-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn animehub_api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: UPLOAD18_API_BASE
+        value: https://upload18.net/api
+      - key: UPLOAD18_API_KEY
+        sync: false
+      - key: UPLOAD18_CATEGORY_ID
+        value: "19"
+      - key: UPLOAD18_FOLDER_ID
+        sync: false
+      - key: ANIMESLAYER_ENABLED
+        value: "false"
+      - key: ANIMESLAYER_ENDPOINT
+        sync: false
