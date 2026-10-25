@@ -134,6 +134,22 @@ async def storage_upload_url(payload: dict):
         raise HTTPException(502, f"Upload18 upload failed: {type(exc).__name__}")
 
 
+@app.post("/v1/storage/download-and-upload")
+async def storage_download_and_upload(payload: dict):
+    """Download an authorized direct file on the server, validate it, then upload it."""
+    direct_url = str(payload.get("direct_url", "")).strip()
+    if not direct_url.startswith("https://"):
+        raise HTTPException(422, "direct_url must be an HTTPS direct media URL")
+    if not UPLOAD18.configured:
+        raise HTTPException(503, "Upload18 integration is not configured")
+    try:
+        result = await asyncio.to_thread(UPLOAD18.download_and_upload, direct_url,
+                                         payload.get("title"), payload.get("folder_id"))
+        return {"provider": "Upload18", "status": "submitted", "server_temp_deleted": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(502, f"server download/upload failed: {type(exc).__name__}")
+
+
 @app.get("/v1/search")
 async def search(q: str = Query(..., min_length=1, max_length=200), limit: int = Query(20, ge=1, le=50)):
     results = await asyncio.to_thread(DATA.search_anime, q)

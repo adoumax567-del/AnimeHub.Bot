@@ -19,6 +19,7 @@ AnimeHub.Bot never returns iframe/player pages. It only returns records classifi
 - `GET /v1/sources`
 - `GET /v1/storage/status`
 - `POST /v1/storage/upload-url` (server-side Upload18 upload from an HTTPS direct media URL)
+- `POST /v1/storage/download-and-upload` (download to server temp storage, validate, upload, then delete temp file)
 - `GET /health`
 
 ## Multi-work jobs
