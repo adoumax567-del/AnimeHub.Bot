@@ -1,5 +1,7 @@
 import asyncio
 import os
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -16,6 +18,7 @@ DATA = DataManager()
 SLAYER = AnimeSlayerProvider()
 JOBS = JobManager()
 UPLOAD18 = Upload18Provider()
+STORAGE_JOBS = {}
 
 
 def direct_downloads(records):
@@ -142,12 +145,35 @@ async def storage_download_and_upload(payload: dict):
         raise HTTPException(422, "direct_url must be an HTTPS direct media URL")
     if not UPLOAD18.configured:
         raise HTTPException(503, "Upload18 integration is not configured")
-    try:
-        result = await asyncio.to_thread(UPLOAD18.download_and_upload, direct_url,
-                                         payload.get("title"), payload.get("folder_id"))
-        return {"provider": "Upload18", "status": "submitted", "server_temp_deleted": True, "result": result}
-    except Exception as exc:
-        raise HTTPException(502, f"server download/upload failed: {type(exc).__name__}")
+    job_id = uuid.uuid4().hex
+    STORAGE_JOBS[job_id] = {"id": job_id, "provider": "Upload18", "status": "queued",
+                             "title": payload.get("title"), "created_at": time.time(),
+                             "server_temp_deleted": False, "result": None, "error": None}
+
+    async def run_job():
+        job = STORAGE_JOBS[job_id]
+        job["status"] = "running"
+        try:
+            result = await asyncio.to_thread(UPLOAD18.download_and_upload, direct_url,
+                                             payload.get("title"), payload.get("folder_id"))
+            job.update({"status": "completed", "server_temp_deleted": True, "result": result})
+        except Exception as exc:
+            job.update({"status": "failed", "server_temp_deleted": True,
+                        "error": {"code": type(exc).__name__, "message": str(exc)}})
+        finally:
+            job["finished_at"] = time.time()
+
+    asyncio.create_task(run_job())
+    return {"provider": "Upload18", "status": "queued", "job_id": job_id,
+            "status_url": f"/v1/storage/jobs/{job_id}"}
+
+
+@app.get("/v1/storage/jobs/{job_id}")
+async def storage_job_status(job_id: str):
+    job = STORAGE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Storage job not found")
+    return job
 
 
 @app.get("/v1/search")
