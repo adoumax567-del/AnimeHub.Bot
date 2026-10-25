@@ -35,6 +35,8 @@ AnimeHub Library/
 
 The database stores logical paths and metadata; the video bytes are not stored in PostgreSQL.
 
+Before a file is moved into the library, the organizer generates a plan with deterministic names such as `Naruto S01E03 - 720p.mp4`. It rejects duplicate paths, reports missing episode numbers per season, keeps different qualities as separate files, and sorts the final manifest by work, season, episode, and quality.
+
 ## Recommended production architecture
 
 - **Android:** Expo/React Native APK with a local SQLite cache for job state and library browsing.

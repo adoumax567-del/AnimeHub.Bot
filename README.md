@@ -14,6 +14,7 @@ AnimeHub.Bot never returns iframe/player pages. It only returns records classifi
 - `GET /v1/links?q=Naruto&episode=1&quality=720p`
 - `GET /v1/download?q=Naruto&episode=1&quality=720p` (307 redirect to the direct file)
 - `GET /v1/batch-links?q=One%20Piece&start=1&limit=20&quality=720p`
+- `POST /v1/library/plan` (preview organized folders and detect duplicates/missing episodes)
 - `GET /v1/work?doc_ref=anime_list/Naruto`
 - `GET /v1/sources`
 - `GET /health`

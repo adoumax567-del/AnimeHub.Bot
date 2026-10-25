@@ -8,6 +8,7 @@ from fastapi.responses import RedirectResponse
 from data_manager import DataManager
 from anime_slayer_provider import AnimeSlayerProvider
 from job_manager import JobManager
+from library_organizer import build_library_plan
 
 SERVICE_NAME = "AnimeHub.Bot"
 DATA = DataManager()
@@ -244,6 +245,15 @@ async def get_job(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+
+@app.post("/v1/library/plan")
+async def library_plan(payload: dict):
+    """Preview organized storage paths and detect duplicate/missing episodes."""
+    items = payload.get("items") or payload.get("files")
+    if not isinstance(items, list) or not items:
+        raise HTTPException(422, "items must be a non-empty list")
+    return build_library_plan(items)
 
 
 @app.post("/v1/jobs/{job_id}/cancel")
