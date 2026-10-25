@@ -9,11 +9,13 @@ from data_manager import DataManager
 from anime_slayer_provider import AnimeSlayerProvider
 from job_manager import JobManager
 from library_organizer import build_library_plan
+from upload18_provider import Upload18Provider
 
 SERVICE_NAME = "AnimeHub.Bot"
 DATA = DataManager()
 SLAYER = AnimeSlayerProvider()
 JOBS = JobManager()
+UPLOAD18 = Upload18Provider()
 
 
 def direct_downloads(records):
@@ -109,6 +111,27 @@ async def sources():
     return {"service": SERVICE_NAME, "direct_only": True,
             "enabled": {"anime_witcher": True, "anime_slayer": SLAYER.enabled and bool(SLAYER.endpoint)},
             "sources": DATA.get_source_catalog()}
+
+
+@app.get("/v1/storage/status")
+async def storage_status():
+    return {"provider": "Upload18", "configured": UPLOAD18.configured,
+            "api_base": UPLOAD18.base_url, "category_id": UPLOAD18.category_id,
+            "folder_configured": bool(UPLOAD18.folder_id), "secret_exposed": False}
+
+
+@app.post("/v1/storage/upload-url")
+async def storage_upload_url(payload: dict):
+    video_url = str(payload.get("video_url", "")).strip()
+    if not video_url.startswith("https://"):
+        raise HTTPException(422, "video_url must be an HTTPS direct media URL")
+    if not UPLOAD18.configured:
+        raise HTTPException(503, "Upload18 integration is not configured")
+    try:
+        result = await asyncio.to_thread(UPLOAD18.upload_url, video_url, payload.get("title"), payload.get("folder_id"))
+        return {"provider": "Upload18", "status": "submitted", "result": result}
+    except Exception as exc:
+        raise HTTPException(502, f"Upload18 upload failed: {type(exc).__name__}")
 
 
 @app.get("/v1/search")

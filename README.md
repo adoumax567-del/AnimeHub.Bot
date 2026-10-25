@@ -17,6 +17,8 @@ AnimeHub.Bot never returns iframe/player pages. It only returns records classifi
 - `POST /v1/library/plan` (preview organized folders and detect duplicates/missing episodes)
 - `GET /v1/work?doc_ref=anime_list/Naruto`
 - `GET /v1/sources`
+- `GET /v1/storage/status`
+- `POST /v1/storage/upload-url` (server-side Upload18 upload from an HTTPS direct media URL)
 - `GET /health`
 
 ## Multi-work jobs
@@ -37,6 +39,8 @@ POST /v1/jobs
 Poll `GET /v1/jobs/{job_id}` for progress. Every episode is marked `completed` or `failed`; failures include the requested episode number and a reason. A job can finish as `completed_with_errors` when only some episodes fail. Use `POST /v1/jobs/{job_id}/pause` and `/resume` to stop and continue without losing completed work, or `/cancel` to stop it permanently. `mode=links` returns direct URLs; `mode=download` returns the same direct URLs for the client application to download to the phone. The server does not proxy or store third-party media.
 
 For production on Railway/Render, use **PostgreSQL** for jobs, work metadata, link history, and deduplication, plus **Redis** for the queue and concurrency control. Do not store video binaries in PostgreSQL. If authorized media must be cached, use an S3-compatible object store and keep only object keys and expiry metadata in PostgreSQL. The current local job manager is intentionally lightweight and in-memory; the next production step is swapping it for Redis/PostgreSQL persistence.
+
+Upload18 is supported through its server API. Configure a restricted `Upload + Read` key on the server only; never put the master key in the APK. The service accepts an HTTPS direct media URL, submits it to Upload18, and records the returned video identifier and processing status. Folder IDs must be created or selected in Upload18 and supplied through `UPLOAD18_FOLDER_ID` or the upload request.
 
 ## Providers
 
