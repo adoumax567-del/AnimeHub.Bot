@@ -33,7 +33,7 @@ POST /v1/jobs
 }
 ```
 
-Poll `GET /v1/jobs/{job_id}` for progress. `mode=links` returns direct URLs; `mode=download` returns the same direct URLs for the client application to download to the phone. The server does not proxy or store third-party media. Use `POST /v1/jobs/{job_id}/cancel` to stop a running job.
+Poll `GET /v1/jobs/{job_id}` for progress. Every episode is marked `completed` or `failed`; failures include the requested episode number and a reason. A job can finish as `completed_with_errors` when only some episodes fail. Use `POST /v1/jobs/{job_id}/pause` and `/resume` to stop and continue without losing completed work, or `/cancel` to stop it permanently. `mode=links` returns direct URLs; `mode=download` returns the same direct URLs for the client application to download to the phone. The server does not proxy or store third-party media.
 
 For production on Railway/Render, use **PostgreSQL** for jobs, work metadata, link history, and deduplication, plus **Redis** for the queue and concurrency control. Do not store video binaries in PostgreSQL. If authorized media must be cached, use an S3-compatible object store and keep only object keys and expiry metadata in PostgreSQL. The current local job manager is intentionally lightweight and in-memory; the next production step is swapping it for Redis/PostgreSQL persistence.
 

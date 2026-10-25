@@ -202,12 +202,21 @@ async def resolve_plan_item(item):
     language = item.get("language")
     episode_numbers = expand_plan_item(item)
     results = []
+    failed_count = 0
     for number in episode_numbers:
-        target, selected, records, _ = await asyncio.to_thread(resolve_work_episode, title, number)
-        records = select_links(records, quality, language)
-        results.append({"work": target.get("name"), "episode": selected.get("order"),
-                        "episode_name": selected.get("name"), "links": [public_link(r) for r in records]})
+        try:
+            target, selected, records, _ = await asyncio.to_thread(resolve_work_episode, title, number)
+            records = select_links(records, quality, language)
+            if not records:
+                raise LookupError("No direct downloadable link matched the requested filters")
+            results.append({"status": "completed", "work": target.get("name"), "episode": selected.get("order"),
+                            "episode_name": selected.get("name"), "links": [public_link(r) for r in records]})
+        except Exception as exc:
+            failed_count += 1
+            results.append({"status": "failed", "requested_episode": number,
+                            "error": {"code": type(exc).__name__, "message": str(exc)}, "links": []})
     return {"mode": item.get("mode", "links"), "requested_title": title, "episodes": results,
+            "completed_count": len(results) - failed_count, "failed_count": failed_count,
             "direct_only": True, "downloadable_only": True}
 
 
@@ -243,3 +252,19 @@ async def cancel_job(job_id: str):
         raise HTTPException(404, "Job not found")
     cancelled = await JOBS.cancel(job_id)
     return {"job_id": job_id, "cancelled": cancelled}
+
+
+@app.post("/v1/jobs/{job_id}/pause")
+async def pause_job(job_id: str):
+    if not JOBS.get(job_id):
+        raise HTTPException(404, "Job not found")
+    paused = await JOBS.pause(job_id)
+    return {"job_id": job_id, "paused": paused, "status": JOBS.get(job_id)["status"]}
+
+
+@app.post("/v1/jobs/{job_id}/resume")
+async def resume_job(job_id: str):
+    if not JOBS.get(job_id):
+        raise HTTPException(404, "Job not found")
+    resumed = await JOBS.resume(job_id)
+    return {"job_id": job_id, "resumed": resumed, "status": JOBS.get(job_id)["status"]}

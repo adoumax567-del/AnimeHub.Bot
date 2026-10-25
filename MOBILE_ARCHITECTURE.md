@@ -17,6 +17,8 @@
 6. The worker downloads authorized media to temporary storage, validates it, moves it to permanent object storage, and writes the library record.
 7. The app displays progress, failures, retry actions, and the organized library.
 
+Each episode is a separate result with `completed` or `failed` status. A failed episode includes its requested number, error code, human-readable reason, and an empty link list. The job is marked `completed_with_errors` when the rest of the plan finishes.
+
 ## Library layout
 
 ```text
@@ -49,6 +51,8 @@ The database stores logical paths and metadata; the video bytes are not stored i
 - `POST /v1/jobs`: create a multi-work job with seasons, episodes, quality, and operation.
 - `GET /v1/jobs/{id}`: progress by work, season, episode, provider, and download state.
 - `POST /v1/jobs/{id}/cancel`: cancel pending work.
+- `POST /v1/jobs/{id}/pause`: pause pending work without losing completed episodes.
+- `POST /v1/jobs/{id}/resume`: resume queued work after connectivity returns.
 - `POST /v1/jobs/{id}/retry`: retry only failed items.
 - `GET /v1/library`: browse organized folders.
 - `GET /v1/library/{id}/stream`: authorized playback URL.
@@ -61,6 +65,7 @@ The database stores logical paths and metadata; the video bytes are not stored i
 - The server never labels a player page as a direct file.
 - Media is downloaded and stored only when the operator has the right to use and store it. Provider links can expire; the library copy remains subject to the source's terms.
 - A Render/Railway restart must not lose a job or a completed media object; that is why PostgreSQL, Redis, and object storage are required.
+- The phone may close or lose internet after submitting a job; the server worker can continue independently. If the source connection fails, the worker records the episode error and the production queue retries it. The APK can reconnect later, read the saved progress, pause, resume, or retry failures.
 
 ## Recommended default
 
