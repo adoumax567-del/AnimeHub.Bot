@@ -171,7 +171,7 @@ async def storage_download_and_upload(payload: dict):
             job["finished_at"] = time.time()
 
     asyncio.create_task(run_job())
-    return {"provider": "Upload18", "status": "queued", "job_id": job_id,
+    return {"provider": "Bunny Stream", "status": "queued", "job_id": job_id,
             "status_url": f"/v1/storage/jobs/{job_id}"}
 
 
