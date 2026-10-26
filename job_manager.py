@@ -23,7 +23,7 @@ class JobManager:
                           "all_episodes": bool(item.get("all_episodes", False)),
                           "library_id": item.get("library_id"),
                           "quality": item.get("quality"), "language": item.get("language"),
-                          "mode": item.get("mode", "links"), "status": "queued", "result": None, "error": None})
+                          "mode": item.get("mode", "download"), "status": "queued", "result": None, "error": None})
         self.jobs[job_id] = {"id": job_id, "status": "queued", "created_at": time.time(),
                              "total": len(items), "completed": 0, "failed": 0, "items": items,
                              "pause_requested": False}
