@@ -1,12 +1,16 @@
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi import FastAPI, Form, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from data_manager import DataManager
 from anime_slayer_provider import AnimeSlayerProvider
 from job_manager import JobManager
@@ -15,12 +19,60 @@ from upload18_provider import Upload18Provider
 from bunny_stream_provider import BunnyStreamProvider
 
 SERVICE_NAME = "AnimeHub.Bot"
+ADMIN_PASSWORD = os.getenv("ANIMEHUB_ADMIN_PASSWORD", "").strip()
+ADMIN_SESSION_SECRET = os.getenv("ANIMEHUB_ADMIN_SESSION_SECRET", "").strip()
 DATA = DataManager()
 SLAYER = AnimeSlayerProvider()
 JOBS = JobManager()
 UPLOAD18 = Upload18Provider()
 BUNNY = BunnyStreamProvider()
 STORAGE_JOBS = {}
+
+
+def _admin_token():
+    if not ADMIN_PASSWORD or not ADMIN_SESSION_SECRET:
+        return None
+    issued = str(int(time.time()))
+    payload = base64.urlsafe_b64encode(issued.encode()).decode().rstrip("=")
+    signature = hmac.new(ADMIN_SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def _admin_authenticated(request):
+    token = request.cookies.get("animehub_admin")
+    if not token or "." not in token or not ADMIN_SESSION_SECRET:
+        return False
+    payload, signature = token.rsplit(".", 1)
+    expected = hmac.new(ADMIN_SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return False
+    try:
+        issued = int(base64.urlsafe_b64decode(payload + "==").decode())
+        return time.time() - issued < 86400
+    except Exception:
+        return False
+
+
+ADMIN_PAGE = r'''<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AnimeHub.Bot · مدير التنزيل</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e8eef7;background:#0b1220}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 90% 0,#173b52 0,#0b1220 42%);min-height:100vh}.shell{max-width:1180px;margin:auto;padding:28px 18px}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px}.brand{font-size:25px;font-weight:800}.muted{color:#9aadc2}.grid{display:grid;grid-template-columns:1.05fr .95fr;gap:18px}.card{background:rgba(19,31,49,.9);border:1px solid #263c55;border-radius:18px;padding:20px;box-shadow:0 16px 40px #0003}.card h2{margin:0 0 14px;font-size:18px}label{display:block;color:#b8c8d9;font-size:13px;margin:12px 0 6px}input,select,textarea{width:100%;border:1px solid #304963;background:#0d1a2b;color:#eef6ff;border-radius:10px;padding:11px;font:inherit}textarea{min-height:280px;resize:vertical;line-height:1.6}button{border:0;border-radius:10px;padding:11px 15px;background:#29b6a8;color:#04131b;font-weight:800;cursor:pointer}button.secondary{background:#20364e;color:#d7e7f6}button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:10px;align-items:end}.row>*{flex:1}.actions{display:flex;gap:10px;align-items:center;margin-top:14px}.hint{font-size:12px;color:#8ea4ba;line-height:1.6}.status{margin-top:14px;padding:12px;border-radius:10px;background:#102238;color:#bcd0e3}.job{padding:14px 0;border-bottom:1px solid #294057}.job:last-child{border-bottom:0}.jobtitle{font-weight:800}.pill{display:inline-block;border-radius:999px;padding:3px 9px;font-size:12px;margin-inline-start:6px;background:#24435b}.ok{background:#145244;color:#9cf0cf}.bad{background:#5a2630;color:#ffc2c8}.warn{background:#5a4721;color:#ffdc8a}.meter{height:7px;border-radius:99px;background:#20364b;overflow:hidden;margin:9px 0}.meter i{display:block;height:100%;background:#29b6a8}.item{font-size:13px;padding:7px 0;border-top:1px solid #23394e}.error{color:#ffb6bd;font-size:12px;margin-top:3px}.hide{display:none}@media(max-width:800px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
+</style></head><body><main class="shell"><header class="top"><div><div class="brand">AnimeHub<span style="color:#29b6a8">.Bot</span></div><div class="muted">مدير التنزيل المنظم · التنفيذ بالترتيب</div></div><button class="secondary" onclick="logout()">تسجيل الخروج</button></header>
+<section class="grid"><div class="card"><h2>إضافة قائمة جديدة</h2><label>القائمة</label><textarea id="list" placeholder="سطر لكل عمل، مثال:\nYour Name | فيلم\nNaruto | مسلسل | 720p | 1-12\nOne Piece | مسلسل | 720p | كل الحلقات"></textarea><div class="hint">الصيغة: الاسم | فيلم/مسلسل | الجودة اختيارية | النطاق اختيارياً. يمكن أيضاً لصق JSON من نوع items.</div><div class="row"><div><label>الجودة الافتراضية</label><select id="quality"><option>720p</option><option>1080p</option><option>480p</option><option>source</option></select></div><div><label>وضع التنفيذ</label><select id="mode"><option value="download">تنزيل ورفع إلى Bunny</option><option value="links">استخراج روابط مباشرة فقط</option></select></div></div><div class="row"><div><label>مكتبة Bunny</label><select id="library"><option value="">جاري تحميل المكتبات...</option></select></div><div><label>عدد الأعمال المتوازية</label><select id="concurrency"><option>6</option><option>8</option><option>5</option><option>3</option><option>1</option></select></div></div><div class="actions"><button id="submit" onclick="submitList()">بدء القائمة</button><span id="formStatus" class="hint"></span></div></div>
+<div class="card"><h2>قواعد التنفيذ</h2><div class="hint" style="font-size:14px;line-height:2">✓ يبدأ من أول عمل إلى آخر عمل<br>✓ يمنع تكرار نفس العمل داخل القائمة<br>✓ لا ينتقل للعمل التالي قبل إنهاء الحالي<br>✓ كل حلقة تسجل مكتملة أو فاشلة مع السبب<br>✓ التنزيل الخادمي يفحص الفيديو قبل رفعه<br>✓ ينظم كل عمل داخل Collection مستقلة في Bunny</div><div id="selected" class="status">لم تبدأ قائمة بعد.</div></div></section>
+<section class="card" style="margin-top:18px"><div class="top" style="margin-bottom:8px"><h2 style="margin:0">المهام والتقارير</h2><button class="secondary" onclick="refreshJobs()">تحديث</button></div><div id="jobs"><div class="muted">لا توجد مهام ظاهرة بعد.</div></div></section></main>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+function parseList(text,quality,mode,library){let t=text.trim();if(!t)return[];if(t.startsWith('[')){let x=JSON.parse(t);return x.map(i=>({...i,quality:i.quality||quality,mode:i.mode||mode,library_id:i.library_id||library}));}return t.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).map(line=>{let p=line.split('|').map(x=>x.trim()), title=p[0], type=(p[1]||'auto').toLowerCase().includes('film')?'film':'series', q=p[2]||quality, range=p[3]||'';let o={title,type,quality:q,mode,library_id:library};if(range&&/^\d+\s*-\s*\d+$/.test(range)){let [a,b]=range.split('-').map(Number);o.start_episode=a;o.end_episode=b;}else if(/كل|all/i.test(range))o.all_episodes=true;else if(type==='film')o.all_episodes=false;return o;});}
+async function submitList(){let b=document.getElementById('submit'),msg=document.getElementById('formStatus');try{let items=parseList(document.getElementById('list').value,document.getElementById('quality').value,document.getElementById('mode').value,document.getElementById('library').value);if(!items.length)throw Error('أدخل قائمة غير فارغة');b.disabled=true;msg.textContent='جاري التحقق من القائمة...';let r=await fetch('/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items,concurrency:Number(document.getElementById('concurrency').value),ordered:false})});let d=await r.json();if(!r.ok)throw Error(d.detail||'تعذر إنشاء المهمة');msg.textContent='تم إنشاء المهمة: '+d.job_id+' · المكرر المحذوف: '+(d.deduplicated||0);document.getElementById('selected').textContent='بدأت القائمة. يتم تشغيل أول الأعمال بالترتيب مع توازٍ محدود. رقم المهمة: '+d.job_id;document.getElementById('list').value='';refreshJobs();}catch(e){msg.textContent=e.message}finally{b.disabled=false}}
+async function refreshJobs(){let r=await fetch('/v1/jobs');if(r.status===401){location.reload();return}let d=await r.json(),root=document.getElementById('jobs');if(!d.jobs?.length){root.innerHTML='<div class="muted">لا توجد مهام ظاهرة بعد.</div>';return}root.innerHTML=d.jobs.slice().reverse().map(j=>{let total=j.total||1,done=j.completed||0, cls=j.status==='completed'?'ok':j.status.includes('error')?'warn':j.status==='failed'?'bad':'pill';let items=(j.items||[]).map(i=>{let r=i.result||{},failed=(r.failed_count||0)+(i.status==='failed'?1:0);return '<div class="item"><b>'+esc(i.title)+'</b> <span class="pill '+(i.status==='completed'?'ok':failed?'bad':'')+'">'+esc(i.status)+'</span>'+ (r.completed_count!=null?'<span class="muted"> · '+r.completed_count+' مكتملة · '+(r.failed_count||0)+' فاشلة</span>':'')+(i.error?'<div class="error">'+esc(i.error.code)+': '+esc(i.error.message)+'</div>': '');}).join('');return '<div class="job"><div class="jobtitle">'+esc(j.id)+' <span class="pill '+cls+'">'+esc(j.status)+'</span></div><div class="meter"><i style="width:'+Math.min(100,done/total*100)+'%"></i></div><div class="muted">الأعمال: '+done+'/'+total+' · فشل: '+(j.failed||0)+'</div>'+items+'</div>'}).join('')}
+async function loadLibraries(){let r=await fetch('/v1/storage/libraries');if(!r.ok)return;let d=await r.json(),s=document.getElementById('library');s.innerHTML=d.libraries.map(x=>'<option value=\"'+esc(x.id)+'\">'+esc(x.name)+' ('+esc(x.id)+')</option>').join('')}
+async function logout(){await fetch('/admin/logout',{method:'POST'});location.reload()}loadLibraries();refreshJobs();setInterval(refreshJobs,2500);
+</script></body></html>'''
+
+
+LOGIN_PAGE = r'''<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AnimeHub.Bot · دخول</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1220;color:#edf5ff;font-family:system-ui}.box{width:min(420px,calc(100% - 32px));background:#132138;border:1px solid #2a4561;border-radius:18px;padding:28px;box-shadow:0 20px 60px #0005}h1{margin-top:0}input,button{width:100%;padding:13px;border-radius:10px;border:1px solid #35516d;background:#0d1a2b;color:#fff;font:inherit;box-sizing:border-box}button{margin-top:12px;background:#29b6a8;color:#03151a;font-weight:800;border:0;cursor:pointer}.err{color:#ffabb4;margin-top:12px}</style><div class="box"><h1>AnimeHub<span style="color:#29b6a8">.Bot</span></h1><p>لوحة إدارة التنزيلات والقوائم</p><form method="post" action="/admin/login"><input name="password" type="password" autocomplete="current-password" placeholder="كلمة المرور" autofocus><button>دخول آمن</button></form>{ERROR}</div></html>'''
 
 
 def direct_downloads(records):
@@ -106,6 +158,34 @@ async def root():
             "endpoints": ["/v1/search", "/v1/links", "/v1/download", "/v1/batch-links", "/v1/sources"]}
 
 
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    if not ADMIN_PASSWORD or not ADMIN_SESSION_SECRET:
+        return HTMLResponse("Admin page is not configured. Set ANIMEHUB_ADMIN_PASSWORD and ANIMEHUB_ADMIN_SESSION_SECRET.", status_code=503)
+    if _admin_authenticated(request):
+        return HTMLResponse(ADMIN_PAGE)
+    return HTMLResponse(LOGIN_PAGE.replace("{ERROR}", ""))
+
+
+@app.post("/admin/login", response_class=HTMLResponse)
+async def admin_login(request: Request, password: str = Form(...)):
+    if not ADMIN_PASSWORD or not ADMIN_SESSION_SECRET:
+        return HTMLResponse("Admin page is not configured.", status_code=503)
+    if not hmac.compare_digest(password, ADMIN_PASSWORD):
+        return HTMLResponse(LOGIN_PAGE.replace("{ERROR}", "<div class='err'>كلمة المرور غير صحيحة.</div>"), status_code=401)
+    response = RedirectResponse("/admin", status_code=303)
+    response.set_cookie("animehub_admin", _admin_token(), max_age=86400, httponly=True,
+                        secure=request.url.scheme == "https", samesite="lax")
+    return response
+
+
+@app.post("/admin/logout")
+async def admin_logout():
+    response = RedirectResponse("/admin", status_code=303)
+    response.delete_cookie("animehub_admin")
+    return response
+
+
 @app.get("/health")
 async def health():
     return {"service": SERVICE_NAME, "status": "healthy", "direct_only": True}
@@ -118,11 +198,25 @@ async def sources():
             "sources": DATA.get_source_catalog()}
 
 
+@app.get("/v1/jobs")
+async def list_jobs(request: Request):
+    if not _admin_authenticated(request):
+        raise HTTPException(401, "Admin authentication required")
+    return {"jobs": list(JOBS.jobs.values())}
+
+
 @app.get("/v1/storage/status")
 async def storage_status():
     return {"provider": "Bunny Stream", "configured": BUNNY.configured,
             "library_id": BUNNY.library_id, "cdn_configured": bool(BUNNY.cdn_hostname),
             "secret_exposed": False}
+
+
+@app.get("/v1/storage/libraries")
+async def storage_libraries():
+    if not BUNNY.configured:
+        raise HTTPException(503, "Bunny Stream integration is not configured")
+    return {"provider": "Bunny Stream", "libraries": BUNNY.library_catalog}
 
 
 @app.post("/v1/storage/upload-url")
@@ -273,7 +367,16 @@ async def resolve_plan_item(item):
         raise ValueError("title is required")
     quality = item.get("quality")
     language = item.get("language")
-    episode_numbers = expand_plan_item(item)
+    if item.get("all_episodes"):
+        found = await asyncio.to_thread(DATA.search_anime, title)
+        if not found:
+            raise LookupError("Work not found")
+        all_episodes = await asyncio.to_thread(DATA.get_episodes, found[0]["doc_ref"])
+        episode_numbers = [int(ep.get("order")) for ep in all_episodes if str(ep.get("order", "")).isdigit()]
+        if not episode_numbers:
+            raise LookupError("No episodes found for this work")
+    else:
+        episode_numbers = expand_plan_item(item)
     # Resolve episodes concurrently as well as work items. Keep the fan-out
     # bounded so a large series cannot exhaust the source APIs or the server.
     episode_limit = max(1, min(int(item.get("episode_concurrency", 6)), 8))
@@ -286,8 +389,21 @@ async def resolve_plan_item(item):
                 records = select_links(records, quality, language)
                 if not records:
                     raise LookupError("No direct downloadable link matched the requested filters")
-                return {"status": "completed", "work": target.get("name"), "episode": selected.get("order"),
-                        "episode_name": selected.get("name"), "links": [public_link(r) for r in records]}
+                result = {"status": "completed", "work": target.get("name"), "episode": selected.get("order"),
+                          "episode_name": selected.get("name"), "links": [public_link(r) for r in records]}
+                if str(item.get("mode", "links")).lower() == "download":
+                    if not BUNNY.configured:
+                        raise RuntimeError("Bunny Stream integration is not configured")
+                    work_name = target.get("name") or title
+                    episode_title = f"{work_name} - Episode {selected.get('order', number):02d} - {quality or 'source'}"
+                    provider = BUNNY.for_library(item.get("library_id"))
+                    stored = await asyncio.to_thread(
+                        provider.server_download_and_upload,
+                        records[0]["download_url"], episode_title, quality, work_name,
+                    )
+                    result["storage"] = stored
+                    result["verified"] = True
+                return result
         except Exception as exc:
             return {"status": "failed", "requested_episode": number,
                     "error": {"code": type(exc).__name__, "message": str(exc)}, "links": []}
@@ -305,15 +421,30 @@ async def create_job(payload: dict):
     plan = payload.get("items") or payload.get("list")
     if not isinstance(plan, list) or not plan:
         raise HTTPException(422, "items must be a non-empty list")
+    # Preserve the first occurrence and drop repeated works before scheduling.
+    # This keeps the user-facing order deterministic and prevents duplicate uploads.
+    unique_plan, seen = [], set()
+    for item in plan:
+        if not isinstance(item, dict):
+            raise HTTPException(422, "each item must be an object")
+        key = (str(item.get("title", "")).strip().casefold(), str(item.get("type", "auto")).casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_plan.append(item)
+    deduplicated = len(plan) - len(unique_plan)
+    plan = unique_plan
     try:
         for item in plan:
             expand_plan_item(item)
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc))
-    concurrency = int(payload.get("concurrency", 4))
+    ordered = bool(payload.get("ordered", False))
+    concurrency = 1 if ordered else int(payload.get("concurrency", 4))
     job = await JOBS.create(plan, resolve_plan_item, concurrency)
     return {"job_id": job["id"], "status": job["status"], "total": job["total"],
             "concurrency": max(1, min(concurrency, 8)),
+            "ordered": ordered, "deduplicated": deduplicated,
             "mode": "client_download" if any(i.get("mode") == "download" for i in plan) else "links",
             "message": "Use GET /v1/jobs/{job_id} to follow progress"}
 

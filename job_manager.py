@@ -20,6 +20,8 @@ class JobManager:
                           "season": item.get("season"), "episodes": item.get("episodes"),
                           "start_episode": item.get("start_episode"), "end_episode": item.get("end_episode"),
                           "episode_concurrency": item.get("episode_concurrency", 6),
+                          "all_episodes": bool(item.get("all_episodes", False)),
+                          "library_id": item.get("library_id"),
                           "quality": item.get("quality"), "language": item.get("language"),
                           "mode": item.get("mode", "links"), "status": "queued", "result": None, "error": None})
         self.jobs[job_id] = {"id": job_id, "status": "queued", "created_at": time.time(),
