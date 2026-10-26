@@ -19,6 +19,7 @@ class JobManager:
             items.append({"id": index + 1, "title": item.get("title", ""), "type": item.get("type", "auto"),
                           "season": item.get("season"), "episodes": item.get("episodes"),
                           "start_episode": item.get("start_episode"), "end_episode": item.get("end_episode"),
+                          "episode_concurrency": item.get("episode_concurrency", 6),
                           "quality": item.get("quality"), "language": item.get("language"),
                           "mode": item.get("mode", "links"), "status": "queued", "result": None, "error": None})
         self.jobs[job_id] = {"id": job_id, "status": "queued", "created_at": time.time(),

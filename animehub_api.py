@@ -274,20 +274,27 @@ async def resolve_plan_item(item):
     quality = item.get("quality")
     language = item.get("language")
     episode_numbers = expand_plan_item(item)
-    results = []
-    failed_count = 0
-    for number in episode_numbers:
+    # Resolve episodes concurrently as well as work items. Keep the fan-out
+    # bounded so a large series cannot exhaust the source APIs or the server.
+    episode_limit = max(1, min(int(item.get("episode_concurrency", 6)), 8))
+    semaphore = asyncio.Semaphore(episode_limit)
+
+    async def resolve_one(number):
         try:
-            target, selected, records, _ = await asyncio.to_thread(resolve_work_episode, title, number)
-            records = select_links(records, quality, language)
-            if not records:
-                raise LookupError("No direct downloadable link matched the requested filters")
-            results.append({"status": "completed", "work": target.get("name"), "episode": selected.get("order"),
-                            "episode_name": selected.get("name"), "links": [public_link(r) for r in records]})
+            async with semaphore:
+                target, selected, records, _ = await asyncio.to_thread(resolve_work_episode, title, number)
+                records = select_links(records, quality, language)
+                if not records:
+                    raise LookupError("No direct downloadable link matched the requested filters")
+                return {"status": "completed", "work": target.get("name"), "episode": selected.get("order"),
+                        "episode_name": selected.get("name"), "links": [public_link(r) for r in records]}
         except Exception as exc:
-            failed_count += 1
-            results.append({"status": "failed", "requested_episode": number,
-                            "error": {"code": type(exc).__name__, "message": str(exc)}, "links": []})
+            return {"status": "failed", "requested_episode": number,
+                    "error": {"code": type(exc).__name__, "message": str(exc)}, "links": []}
+
+    # gather preserves the requested episode order while doing the I/O in parallel.
+    results = await asyncio.gather(*(resolve_one(number) for number in episode_numbers))
+    failed_count = sum(1 for result in results if result.get("status") == "failed")
     return {"mode": item.get("mode", "links"), "requested_title": title, "episodes": results,
             "completed_count": len(results) - failed_count, "failed_count": failed_count,
             "direct_only": True, "downloadable_only": True}
