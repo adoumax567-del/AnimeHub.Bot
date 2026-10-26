@@ -12,12 +12,14 @@ from anime_slayer_provider import AnimeSlayerProvider
 from job_manager import JobManager
 from library_organizer import build_library_plan
 from upload18_provider import Upload18Provider
+from bunny_stream_provider import BunnyStreamProvider
 
 SERVICE_NAME = "AnimeHub.Bot"
 DATA = DataManager()
 SLAYER = AnimeSlayerProvider()
 JOBS = JobManager()
 UPLOAD18 = Upload18Provider()
+BUNNY = BunnyStreamProvider()
 STORAGE_JOBS = {}
 
 
@@ -118,9 +120,9 @@ async def sources():
 
 @app.get("/v1/storage/status")
 async def storage_status():
-    return {"provider": "Upload18", "configured": UPLOAD18.configured,
-            "api_base": UPLOAD18.base_url, "category_id": UPLOAD18.category_id,
-            "folder_configured": bool(UPLOAD18.folder_id), "secret_exposed": False}
+    return {"provider": "Bunny Stream", "configured": BUNNY.configured,
+            "library_id": BUNNY.library_id, "cdn_configured": bool(BUNNY.cdn_hostname),
+            "secret_exposed": False}
 
 
 @app.post("/v1/storage/upload-url")
@@ -143,10 +145,10 @@ async def storage_download_and_upload(payload: dict):
     direct_url = str(payload.get("direct_url", "")).strip()
     if not direct_url.startswith("https://"):
         raise HTTPException(422, "direct_url must be an HTTPS direct media URL")
-    if not UPLOAD18.configured:
-        raise HTTPException(503, "Upload18 integration is not configured")
+    if not BUNNY.configured:
+        raise HTTPException(503, "Bunny Stream integration is not configured")
     job_id = uuid.uuid4().hex
-    STORAGE_JOBS[job_id] = {"id": job_id, "provider": "Upload18", "status": "queued",
+    STORAGE_JOBS[job_id] = {"id": job_id, "provider": "Bunny Stream", "status": "queued",
                              "title": payload.get("title"), "created_at": time.time(),
                              "server_temp_deleted": False, "result": None, "error": None}
 
@@ -154,8 +156,13 @@ async def storage_download_and_upload(payload: dict):
         job = STORAGE_JOBS[job_id]
         job["status"] = "running"
         try:
-            result = await asyncio.to_thread(UPLOAD18.download_and_upload, direct_url,
-                                             payload.get("title"), payload.get("folder_id"))
+            result = await asyncio.to_thread(
+                BUNNY.server_download_and_upload,
+                direct_url,
+                payload.get("title") or "Untitled",
+                payload.get("quality"),
+                payload.get("collection_name") or payload.get("title") or "AnimeHub Library",
+            )
             job.update({"status": "completed", "server_temp_deleted": True, "result": result})
         except Exception as exc:
             job.update({"status": "failed", "server_temp_deleted": True,

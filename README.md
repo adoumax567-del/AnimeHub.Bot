@@ -21,6 +21,8 @@ AnimeHub.Bot never returns iframe/player pages. It only returns records classifi
 - `POST /v1/storage/upload-url` (server-side Upload18 upload from an HTTPS direct media URL)
 - `POST /v1/storage/download-and-upload` (download to server temp storage, validate, upload, then delete temp file)
 - `GET /v1/storage/jobs/{job_id}` (poll background storage progress and exact failure reason)
+
+Bunny Stream is the primary server-side library provider. The configured library is `BUNNY_STREAM_LIBRARY_ID`; each requested work is placed in an automatically created Bunny collection named after the work, and the requested quality is passed to Bunny encoding when supported. Keep `BUNNY_STREAM_API_KEY` server-side only.
 - `GET /health`
 
 ## Multi-work jobs
