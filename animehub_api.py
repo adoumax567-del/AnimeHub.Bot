@@ -463,7 +463,12 @@ async def create_job(payload: dict):
     for item in plan:
         if not isinstance(item, dict):
             raise HTTPException(422, "each item must be an object")
-        key = (str(item.get("title", "")).strip().casefold(), str(item.get("type", "auto")).casefold())
+        # Same-name works can be different MAL entries, years, cuts, or
+        # seasons. Only collapse an actually identical request.
+        identity_fields = ("mal_id", "myanimelist_id", "year", "season", "version", "edition", "quality", "language")
+        key = (str(item.get("title", "")).strip().casefold(),
+               str(item.get("type", "auto")).strip().casefold(),
+               tuple(str(item.get(field, "")).strip().casefold() for field in identity_fields))
         if key in seen:
             continue
         seen.add(key)
