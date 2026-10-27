@@ -68,7 +68,7 @@ ADMIN_PAGE = r'''<!doctype html>
 <section class="card" style="margin-top:18px"><div class="top" style="margin-bottom:8px"><h2 style="margin:0">المهام والتقارير</h2><button class="secondary" onclick="refreshJobs()">تحديث</button></div><div id="jobs"><div class="muted">لا توجد مهام ظاهرة بعد.</div></div></section></main>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-function parseList(text,quality,library){let t=text.trim();if(!t)return[];if(t.startsWith('[')){let x=JSON.parse(t);return x.map(i=>({...i,quality:i.quality||quality,mode:'download',library_id:i.library_id||library}));}return t.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).map(line=>{let p=line.split('|').map(x=>x.trim()), title=p[0], type=(p[1]||'auto').toLowerCase().includes('film')?'film':'series', q=p[2]||quality, range=p[3]||'';let o={title,type,quality:q,mode:'download',library_id:library};if(range&&/^\d+\s*-\s*\d+$/.test(range)){let [a,b]=range.split('-').map(Number);o.start_episode=a;o.end_episode=b;}else if(/كل|all/i.test(range))o.all_episodes=true;else if(type==='film')o.all_episodes=false;return o;});}
+function parseList(text,quality,library){let t=text.trim();if(!t)return[];if(t.startsWith('[')){let x=JSON.parse(t);return x.map(i=>({...i,quality:i.quality||quality,mode:'download',library_id:i.library_id||library}));}return t.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).map(line=>{let p=line.split('|').map(x=>x.trim()), title=p[0], type=/(film|movie|فيلم|فلم)/i.test(p[1]||'')?'film':'series', q=p[2]||quality, range=p[3]||'';let o={title,type,quality:q,mode:'download',library_id:library};if(range&&/^\d+\s*-\s*\d+$/.test(range)){let [a,b]=range.split('-').map(Number);o.start_episode=a;o.end_episode=b;}else if(/كل|all/i.test(range))o.all_episodes=true;else if(type==='film')o.all_episodes=false;return o;});}
 async function submitList(){let b=document.getElementById('submit'),msg=document.getElementById('formStatus');try{let items=parseList(document.getElementById('list').value,document.getElementById('quality').value,document.getElementById('library').value);if(!items.length)throw Error('أدخل قائمة غير فارغة');b.disabled=true;msg.textContent='جاري التحقق من القائمة...';let r=await fetch('/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items,concurrency:6,ordered:false,download_only:true})});let d=await r.json();if(!r.ok)throw Error(d.detail||'تعذر إنشاء المهمة');msg.textContent='تم إنشاء المهمة: '+d.job_id+' · المكرر المحذوف: '+(d.deduplicated||0);document.getElementById('selected').textContent='بدأ التنزيل. يعمل النظام تلقائياً بتوازٍ آمن. رقم المهمة: '+d.job_id;document.getElementById('list').value='';refreshJobs();}catch(e){msg.textContent=e.message}finally{b.disabled=false}}
 async function refreshJobs(){let r=await fetch('/v1/jobs');if(r.status===401){location.reload();return}let d=await r.json(),root=document.getElementById('jobs');if(!d.jobs?.length){root.innerHTML='<div class="muted">لا توجد مهام ظاهرة بعد.</div>';return}root.innerHTML=d.jobs.slice().reverse().map(j=>{let total=j.total||1,done=j.completed||0, cls=j.status==='completed'?'ok':j.status.includes('error')?'warn':j.status==='failed'?'bad':'pill';let items=(j.items||[]).map(i=>{let r=i.result||{},failed=(r.failed_count||0)+(i.status==='failed'?1:0),episodeErrors=(r.episodes||[]).filter(e=>e.status==='failed').map(e=>'<div class=\"error\">الحلقة '+esc(e.requested_episode||e.episode||'?')+': '+esc((e.error||{}).message||'فشل غير محدد')+'</div>').join('');return '<div class=\"item\"><b>'+esc(i.title)+'</b> <span class=\"pill '+(i.status==='completed'?'ok':failed?'bad':'')+'\">'+esc(i.status)+'</span>'+ (r.completed_count!=null?'<span class=\"muted\"> · '+r.completed_count+' مكتملة · '+(r.failed_count||0)+' فاشلة</span>':'')+(i.error?'<div class=\"error\">'+esc(i.error.code)+': '+esc(i.error.message)+'</div>':'')+episodeErrors+'</div>';}).join('');return '<div class="job"><div class="jobtitle">'+esc(j.id)+' <span class="pill '+cls+'">'+esc(j.status)+'</span></div><div class="meter"><i style="width:'+Math.min(100,done/total*100)+'%"></i></div><div class="muted">الأعمال: '+done+'/'+total+' · فشل: '+(j.failed||0)+'</div>'+items+'</div>'}).join('')}
 async function loadLibraries(){let r=await fetch('/v1/storage/libraries');if(!r.ok)return;let d=await r.json(),s=document.getElementById('library');s.innerHTML=d.libraries.map(x=>'<option value=\"'+esc(x.id)+'\">'+esc(x.name)+' ('+esc(x.id)+')</option>').join('')}
@@ -353,13 +353,16 @@ async def batch_links(q: str = Query(..., min_length=1, max_length=200), start: 
 
 
 def expand_plan_item(item):
-    kind = str(item.get("type", "auto")).lower()
-    if kind == "film":
+    kind = str(item.get("type") or "auto").strip().lower()
+    is_film = kind in {"film", "movie", "فيلم", "فلم"} or "فيلم" in kind or "فلم" in kind
+    if is_film:
         return [1]
     if isinstance(item.get("episodes"), list) and item["episodes"]:
         return [int(x) for x in item["episodes"]]
-    start = int(item.get("start_episode", 1))
-    end = int(item.get("end_episode", start))
+    raw_start = item.get("start_episode")
+    raw_end = item.get("end_episode")
+    start = int(raw_start if raw_start is not None and str(raw_start).strip() else 1)
+    end = int(raw_end if raw_end is not None and str(raw_end).strip() else start)
     if end < start or end - start > 100:
         raise ValueError("Each series item must contain a range of at most 100 episodes")
     return list(range(start, end + 1))
