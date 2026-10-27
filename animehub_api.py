@@ -401,7 +401,11 @@ async def resolve_plan_item(item):
                 if str(item.get("mode", "links")).lower() == "download":
                     if not BUNNY.configured:
                         raise RuntimeError("Bunny Stream integration is not configured")
-                    work_name = target.get("name") or title
+                    canonical_name = target.get("name") or title
+                    # Keep the user's label in storage identity. Two different
+                    # cuts/editions may resolve to one canonical database title,
+                    # and must remain distinguishable instead of being merged.
+                    work_name = title or canonical_name
                     episode_title = f"{work_name} - Episode {selected.get('order', number):02d} - {quality or 'source'}"
                     provider = BUNNY.for_library(item.get("library_id"))
                     attempts = []
@@ -417,6 +421,8 @@ async def resolve_plan_item(item):
                                     provider.server_download_and_upload,
                                     record["download_url"], episode_title, quality, work_name,
                                 )
+                            result["canonical_work"] = canonical_name
+                            result["requested_title"] = title
                             result["selected_source"] = record.get("name")
                             result["storage"] = stored
                             result["verified"] = True
