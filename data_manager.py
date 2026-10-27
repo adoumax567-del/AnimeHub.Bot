@@ -2,6 +2,7 @@ import os
 import re
 import requests
 import logging
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from rapidfuzz import fuzz
 
@@ -72,7 +73,7 @@ class DataManager:
 
     def read_firestore_document(self, path):
         """Read a document and return unwrapped fields, or None on failure."""
-        url = f"{self.firestore_base_url}/{str(path).lstrip('/')}"
+        url = self._firestore_url(path)
         headers = {"Authorization": f"Bearer {self.id_token}"} if self.id_token else {}
         try:
             response = requests.get(url, headers=headers, params={"key": self.firebase_api_key}, timeout=10)
@@ -83,6 +84,11 @@ class DataManager:
         except Exception as exc:
             logger.warning("Firestore document error %s: %s", path, exc)
             return None
+
+    def _firestore_url(self, path):
+        """Build a Firestore REST URL while preserving collection separators."""
+        segments = [quote(segment, safe="") for segment in str(path).lstrip('/').split('/')]
+        return f"{self.firestore_base_url}/{'/'.join(segments)}"
 
     @staticmethod
     def _link_metadata(key, parent_key="", record=None):
@@ -385,7 +391,7 @@ class DataManager:
     def get_anime_details(self, doc_ref):
         # Ensure doc_ref format is correct
         if not doc_ref.startswith("http"):
-            url = f"{self.firestore_base_url}/{str(doc_ref).lstrip('/')}"
+            url = self._firestore_url(doc_ref)
         else:
             url = doc_ref
             
@@ -466,7 +472,7 @@ class DataManager:
         headers = {"Authorization": f"Bearer {self.id_token}"} if self.id_token else {}
         try:
             base = str(doc_ref).lstrip('/')
-            summary_url = f"{self.firestore_base_url}/{base}/episodes_summery/summery"
+            summary_url = self._firestore_url(f"{base}/episodes_summery/summery")
             summary_res = requests.get(summary_url, headers=headers, params={"key": self.firebase_api_key}, timeout=10)
             episodes_status = summary_res.status_code
             summary_fields = summary_res.json().get("fields", {}) if summary_res.status_code == 200 else {}
@@ -476,7 +482,7 @@ class DataManager:
                     for item in summary_items if isinstance(item, dict) and item.get("doc_id")]
             # The app falls back to the real episodes subcollection when the summary is absent.
             if not docs:
-                url = f"{self.firestore_base_url}/{base}/episodes"
+                url = self._firestore_url(f"{base}/episodes")
                 res = requests.get(url, headers=headers, params={"key": self.firebase_api_key}, timeout=10)
                 episodes_status = res.status_code
                 docs = res.json().get("documents", []) if res.status_code == 200 else []
@@ -539,7 +545,7 @@ class DataManager:
                     fields = self.expand_server_ids(item)
                     all_records.extend(self._server_record_from_fields(fields, compact_path))
             # Then read the normal servers subcollection, exactly as the app does.
-            url = f"{self.firestore_base_url}/{base}/episodes/{ep_id}/servers"
+            url = self._firestore_url(f"{base}/episodes/{ep_id}/servers")
             res = requests.get(url, headers=headers, params={"key": self.firebase_api_key}, timeout=10)
             if res.status_code == 200:
                 for document in res.json().get("documents", []):
