@@ -129,6 +129,45 @@ class BunnyStreamProvider:
         response.raise_for_status()
         return response.json()
 
+    def delete_video(self, video_id):
+        response = requests.delete(self._url(f"/videos/{video_id}"), headers=self._headers(), timeout=30)
+        if response.status_code not in (200, 204, 404):
+            response.raise_for_status()
+
+    def remote_fetch_and_wait(self, direct_url, title, quality=None, collection_id=None):
+        """Let Bunny fetch the HTTPS file directly, avoiding a Render disk hop."""
+        body = {"url": direct_url, "title": str(title)[:255]}
+        if collection_id:
+            body["collectionId"] = collection_id
+        if quality:
+            body["enabledResolutions"] = str(quality)
+        response = requests.post(
+            self._url("/videos/fetch"), headers={**self._headers(), "Content-Type": "application/json"},
+            json=body, timeout=60,
+        )
+        response.raise_for_status()
+        created = response.json()
+        video_id = created.get("guid") or created.get("videoId")
+        if not video_id:
+            raise RuntimeError("Bunny fetch did not return a video id")
+        deadline = time.time() + int(os.getenv("BUNNY_FETCH_TIMEOUT_SECONDS", "1800"))
+        try:
+            while time.time() < deadline:
+                current = self.video(video_id)
+                status = current.get("status")
+                progress = current.get("encodeProgress")
+                if status in (4, "4") and (progress is None or int(progress) >= 100):
+                    return {"video_id": video_id, "created": current, "fetched_directly": True,
+                            "validation": {"source": "Bunny remote fetch", "encodeProgress": progress},
+                            **self.playback(video_id)}
+                if status in (5, 6, "5", "6", "failed", "error"):
+                    raise RuntimeError(f"Bunny remote fetch failed with status {status}")
+                time.sleep(5)
+            raise TimeoutError("Bunny remote fetch encoding timed out")
+        except Exception:
+            self.delete_video(video_id)
+            raise
+
     def video(self, video_id):
         response = requests.get(self._url(f"/videos/{video_id}"), headers=self._headers(), timeout=30)
         response.raise_for_status()
@@ -172,6 +211,13 @@ class BunnyStreamProvider:
                 return {"video_id": video_id, "created": existing,
                         "deduplicated": True, "validation": {"source": "existing Bunny video"},
                         **self.playback(video_id)}
+        if os.getenv("BUNNY_REMOTE_FETCH", "true").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                return self.remote_fetch_and_wait(direct_url, title, quality, collection_id)
+            except Exception:
+                # Some direct hosts block Bunny's fetcher. Fall back to the
+                # validated Render staging path instead of losing the job.
+                pass
         os.makedirs(temp_dir, exist_ok=True)
         filename = hashlib.sha256(direct_url.encode()).hexdigest()[:24] + ".mp4"
         path = Path(temp_dir) / filename
