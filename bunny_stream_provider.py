@@ -60,6 +60,28 @@ class BunnyStreamProvider:
         data = response.json()
         return data if isinstance(data, list) else data.get("items", data.get("data", []))
 
+    def list_videos(self, page=1, items_per_page=100):
+        response = requests.get(
+            self._url("/videos"), headers=self._headers(),
+            params={"page": page, "itemsPerPage": items_per_page}, timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else data.get("items", data.get("data", []))
+
+    def find_video(self, title, collection_id=None):
+        wanted = str(title or "").strip().casefold()
+        if not wanted:
+            return None
+        for video in self.list_videos():
+            if str(video.get("title", "")).strip().casefold() != wanted:
+                continue
+            video_collection = video.get("collectionId") or video.get("collection_id")
+            if collection_id and video_collection and str(video_collection) != str(collection_id):
+                continue
+            return video
+        return None
+
     def list_libraries(self):
         response = requests.get(f"{self.base_url}/libraries", headers=self._headers(), timeout=30)
         response.raise_for_status()
@@ -141,6 +163,15 @@ class BunnyStreamProvider:
         """Stage an authorized direct file on the server, validate it, then upload to Bunny."""
         if not direct_url.startswith("https://"):
             raise ValueError("Only HTTPS direct media URLs are accepted")
+        collection = self.ensure_collection(collection_name) if collection_name else None
+        collection_id = collection.get("guid") if collection else None
+        existing = self.find_video(title, collection_id)
+        if existing:
+            video_id = existing.get("guid") or existing.get("videoId")
+            if video_id:
+                return {"video_id": video_id, "created": existing,
+                        "deduplicated": True, "validation": {"source": "existing Bunny video"},
+                        **self.playback(video_id)}
         os.makedirs(temp_dir, exist_ok=True)
         filename = hashlib.sha256(direct_url.encode()).hexdigest()[:24] + ".mp4"
         path = Path(temp_dir) / filename
@@ -154,8 +185,7 @@ class BunnyStreamProvider:
             if path.stat().st_size < 1024:
                 raise RuntimeError("Downloaded media is empty or too small")
             validation = self.validate_media(path)
-            collection = self.ensure_collection(collection_name) if collection_name else None
-            created = self.create_video(title, collection.get("guid") if collection else None)
+            created = self.create_video(title, collection_id)
             video_id = created.get("guid") or created.get("videoId")
             if not video_id:
                 raise RuntimeError("Bunny did not return a video id")
