@@ -68,7 +68,7 @@ ADMIN_PAGE = r'''<!doctype html>
 <section class="card" style="margin-top:18px"><div class="top" style="margin-bottom:8px"><h2 style="margin:0">المهام والتقارير</h2><button class="secondary" onclick="refreshJobs()">تحديث</button></div><div id="jobs"><div class="muted">لا توجد مهام ظاهرة بعد.</div></div></section></main>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-function parseList(text,quality,library){let t=text.trim();if(!t)return[];if(t.startsWith('[')){let x=JSON.parse(t);return x.map(i=>({...i,quality:i.quality||quality,mode:'download',library_id:i.library_id||library}));}return t.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).map(line=>{let p=line.split('|').map(x=>x.trim()), title=p[0], type=/(film|movie|فيلم|فلم)/i.test(p[1]||'')?'film':'series', q=p[2]||quality, range=p[3]||'';let o={title,type,quality:q,mode:'download',library_id:library};if(range&&/^\d+\s*-\s*\d+$/.test(range)){let [a,b]=range.split('-').map(Number);o.start_episode=a;o.end_episode=b;}else if(/كل|all/i.test(range))o.all_episodes=true;else if(type==='film')o.all_episodes=false;return o;});}
+function parseList(text,quality,library){let t=text.trim();if(!t)return[];if(t.startsWith('[')){let x=JSON.parse(t);return x.map(i=>({...i,quality:i.quality||quality,mode:'download',library_id:i.library_id||library}));}return t.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).map(line=>{let p=line.split('|').map(x=>x.trim()), title=p[0], mal=(title.match(/^\[?MAL\s*:\s*(\d+)\]?\s*/i)||[])[1];title=title.replace(/^\[?MAL\s*:\s*\d+\]?\s*/i,'').trim();let type=/(film|movie|فيلم|فلم)/i.test(p[1]||'')?'film':'series', q=p[2]||quality, range=p[3]||'';let o={title,type,quality:q,mode:'download',library_id:library};if(mal)o.mal_id=mal;if(range&&/^\d+\s*-\s*\d+$/.test(range)){let [a,b]=range.split('-').map(Number);o.start_episode=a;o.end_episode=b;}else if(/كل|all/i.test(range))o.all_episodes=true;else if(type==='film')o.all_episodes=false;return o;});}
 async function submitList(){let b=document.getElementById('submit'),msg=document.getElementById('formStatus');try{let items=parseList(document.getElementById('list').value,document.getElementById('quality').value,document.getElementById('library').value);if(!items.length)throw Error('أدخل قائمة غير فارغة');b.disabled=true;msg.textContent='جاري التحقق من القائمة...';let r=await fetch('/v1/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items,concurrency:6,ordered:false,download_only:true})});let d=await r.json();if(!r.ok)throw Error(d.detail||'تعذر إنشاء المهمة');msg.textContent='تم إنشاء المهمة: '+d.job_id+' · المكرر المحذوف: '+(d.deduplicated||0);document.getElementById('selected').textContent='بدأ التنزيل. يعمل النظام تلقائياً بتوازٍ آمن. رقم المهمة: '+d.job_id;document.getElementById('list').value='';refreshJobs();}catch(e){msg.textContent=e.message}finally{b.disabled=false}}
 async function refreshJobs(){let r=await fetch('/v1/jobs');if(r.status===401){location.reload();return}let d=await r.json(),root=document.getElementById('jobs');if(!d.jobs?.length){root.innerHTML='<div class="muted">لا توجد مهام ظاهرة بعد.</div>';return}root.innerHTML=d.jobs.slice().reverse().map(j=>{let total=j.total||1,done=j.completed||0, cls=j.status==='completed'?'ok':j.status.includes('error')?'warn':j.status==='failed'?'bad':'pill';let items=(j.items||[]).map(i=>{let r=i.result||{},failed=(r.failed_count||0)+(i.status==='failed'?1:0),episodeErrors=(r.episodes||[]).filter(e=>e.status==='failed').map(e=>'<div class=\"error\">الحلقة '+esc(e.requested_episode||e.episode||'?')+': '+esc((e.error||{}).message||'فشل غير محدد')+'</div>').join('');return '<div class=\"item\"><b>'+esc(i.title)+'</b> <span class=\"pill '+(i.status==='completed'?'ok':failed?'bad':'')+'\">'+esc(i.status)+'</span>'+ (r.completed_count!=null?'<span class=\"muted\"> · '+r.completed_count+' مكتملة · '+(r.failed_count||0)+' فاشلة</span>':'')+(i.error?'<div class=\"error\">'+esc(i.error.code)+': '+esc(i.error.message)+'</div>':'')+episodeErrors+'</div>';}).join('');return '<div class="job"><div class="jobtitle">'+esc(j.id)+' <span class="pill '+cls+'">'+esc(j.status)+'</span></div><div class="meter"><i style="width:'+Math.min(100,done/total*100)+'%"></i></div><div class="muted">الأعمال: '+done+'/'+total+' · فشل: '+(j.failed||0)+'</div>'+items+'</div>'}).join('')}
 async function loadLibraries(){let r=await fetch('/v1/storage/libraries');if(!r.ok)return;let d=await r.json(),s=document.getElementById('library');s.innerHTML=d.libraries.map(x=>'<option value=\"'+esc(x.id)+'\">'+esc(x.name)+' ('+esc(x.id)+')</option>').join('')}
@@ -109,11 +109,18 @@ def public_link(record):
     }
 
 
-def resolve_work_episode(title, episode_number):
+def resolve_work_episode(title, episode_number, mal_id=None):
     results = DATA.search_anime(title)
     if not results:
         raise LookupError("Work not found")
-    target = results[0]
+    if mal_id is not None and str(mal_id).strip():
+        wanted_mal = str(mal_id).strip()
+        matches = [r for r in results if str(r.get("mal_id", "")).strip() == wanted_mal]
+        if not matches:
+            raise LookupError(f"No search result matched MyAnimeList ID {wanted_mal}")
+        target = matches[0]
+    else:
+        target = results[0]
     episodes = DATA.get_episodes(target["doc_ref"])
     selected = next((e for e in episodes if e.get("order") == episode_number), None)
     # Firestore marks a standalone movie as order 999; expose it to clients as
@@ -392,7 +399,10 @@ async def resolve_plan_item(item):
     async def resolve_one(number):
         try:
             async with semaphore:
-                target, selected, records, _ = await asyncio.to_thread(resolve_work_episode, title, number)
+                target, selected, records, _ = await asyncio.to_thread(
+                    resolve_work_episode, title, number,
+                    item.get("mal_id") or item.get("myanimelist_id"),
+                )
                 records = select_links(records, quality, language)
                 if not records:
                     raise LookupError("No direct downloadable link matched the requested filters")

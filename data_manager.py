@@ -327,6 +327,9 @@ class DataManager:
                     "doc_ref": doc_ref,
                     "poster": h.get("poster") or h.get("image") or h.get("cover"),
                     "aliases": aliases,
+                    "mal_id": h.get("mal_id") or h.get("malId") or h.get("myanimelist_id") or details.get("mal_id") or details.get("malId"),
+                    "year": h.get("year") or h.get("aired_from") or details.get("year"),
+                    "type": h.get("type") or details.get("type"),
                     "sources": [source],
                 }
             elif source not in unique[oid]["sources"]:
