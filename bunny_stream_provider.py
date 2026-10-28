@@ -149,10 +149,31 @@ class BunnyStreamProvider:
         if quality:
             params["enabledResolutions"] = str(quality)
         with path.open("rb") as stream:
-            response = requests.put(self._url(f"/videos/{video_id}"), headers={**self._headers(), "Content-Type": "application/octet-stream"},
-                                    params=params, data=stream, timeout=(30, 1800))
+            response = requests.put(
+                self._url(f"/videos/{video_id}"),
+                headers={**self._headers(), "Content-Type": "application/octet-stream"},
+                params=params, data=stream, timeout=(30, 1800),
+            )
         response.raise_for_status()
-        return response.json()
+        return response.json() if response.content else {"success": True}
+
+    def upload_stream(self, chunk_iter, video_id, quality=None, content_length=None):
+        """Upload binary chunks to Bunny without buffering the whole file on disk."""
+        params = {}
+        if quality:
+            params["enabledResolutions"] = str(quality)
+        headers = {**self._headers(), "Content-Type": "application/octet-stream"}
+        if content_length and int(content_length) > 0:
+            headers["Content-Length"] = str(int(content_length))
+        response = requests.put(
+            self._url(f"/videos/{video_id}"),
+            headers=headers,
+            params=params,
+            data=chunk_iter,
+            timeout=(30, 3600),
+        )
+        response.raise_for_status()
+        return response.json() if response.content else {"success": True}
 
     def fetch_url(self, direct_url, title, collection_id=None):
         body = {"url": direct_url, "title": str(title)[:255]}
@@ -170,11 +191,10 @@ class BunnyStreamProvider:
     def remote_fetch_and_wait(self, direct_url, title, quality=None, collection_id=None):
         """Submit a Bunny fetch, then poll until content arrives or fails.
 
-        Bunny may accept the request (success=true) and still fail later while
-        pulling from hosts that block datacenter IPs (PixelDrain, etc.). We poll
-        the created video and only return success when storageSize grows or the
-        status reaches encoding/finished. On failure we delete the empty video
-        and raise so the caller can fall back to server-side upload.
+        Bunny may accept the request then fail while pulling from hosts that
+        block datacenter IPs (PixelDrain, etc.). We only treat the job as
+        successful when storageSize grows or encoding starts. On failure the
+        empty video is deleted and an error is raised for fallback.
         """
         body = {"url": direct_url, "title": str(title)[:255]}
         params = {"collectionId": str(collection_id)} if collection_id else None
@@ -203,7 +223,6 @@ class BunnyStreamProvider:
 
         video_id = accepted.get("guid") or accepted.get("videoId")
         if not video_id:
-            # Bunny sometimes returns only StatusModel; locate the new entry.
             deadline = time.time() + 20
             while time.time() < deadline and not video_id:
                 time.sleep(2)
@@ -216,9 +235,8 @@ class BunnyStreamProvider:
         if not video_id:
             raise RuntimeError("Bunny remote fetch accepted but no video id was created")
 
-        # Poll until Bunny actually received bytes or reported failure.
-        # Status: 0 queued, 1 processing, 2 encoding, 3 finished, 4 res finished, 5 failed
-        poll_seconds = max(15, min(int(os.getenv("BUNNY_FETCH_POLL_SECONDS", "75")), 180))
+        # Short poll — PixelDrain usually fails fast for Bunny; don't waste minutes.
+        poll_seconds = max(10, min(int(os.getenv("BUNNY_FETCH_POLL_SECONDS", "40")), 120))
         deadline = time.time() + poll_seconds
         last = {}
         while time.time() < deadline:
@@ -231,7 +249,6 @@ class BunnyStreamProvider:
             status = last.get("status")
             storage = int(last.get("storageSize") or last.get("storage_size") or 0)
             length = int(last.get("length") or 0)
-            # Content arrived or encoding started with real data.
             if storage > 0 or length > 0 or status in (2, 3, 4):
                 result = {
                     "title": str(title)[:255],
@@ -248,7 +265,6 @@ class BunnyStreamProvider:
                 }
                 result.update(self.playback(video_id))
                 return result
-            # Explicit failure from Bunny.
             if status == 5:
                 try:
                     self.delete_video(video_id)
@@ -257,9 +273,8 @@ class BunnyStreamProvider:
                 raise RuntimeError(
                     f"Bunny remote fetch failed for source (status=5, storage={storage})"
                 )
-            time.sleep(4)
+            time.sleep(3)
 
-        # Timed out with empty video — treat as failure and clean up.
         try:
             self.delete_video(video_id)
         except Exception:
@@ -282,8 +297,7 @@ class BunnyStreamProvider:
     def validate_media(path):
         """Reject truncated/non-media downloads before creating a Bunny video.
 
-        ffprobe is preferred but optional: on hosts without ffmpeg we fall back
-        to a minimum size check so server-side upload still works on Render.
+        ffprobe is preferred but optional so Render hosts without ffmpeg still work.
         """
         path = Path(path)
         size = path.stat().st_size if path.is_file() else 0
@@ -307,49 +321,149 @@ class BunnyStreamProvider:
             raise RuntimeError("Downloaded media has zero duration")
         return {"duration": duration, "size": size}
 
-    def server_download_and_upload(self, direct_url, title, quality=None, collection_name=None, temp_dir="/tmp/animehub"):
-        """Stage an authorized direct file on the server, validate it, then upload to Bunny.
+    @staticmethod
+    def _looks_like_direct_media(url):
+        u = (url or "").lower()
+        if "pixeldrain.com/api/file/" in u:
+            return True
+        if any(u.endswith(ext) for ext in (".mp4", ".mkv", ".webm", ".m4v", ".ts")):
+            return True
+        if "mediafire.com" in u and "/file/" in u:
+            # MediaFire page links are not direct binaries.
+            return False
+        return u.startswith("https://")
 
-        Strategy (fast + reliable for lists):
-        1. Prefer Bunny remote fetch when enabled — Bunny pulls the file (fast).
-           We poll until real content arrives; on failure we clean up and fall back.
-        2. Fall back to download-on-server + binary upload (works when hosts block Bunny).
+    def stream_url_to_bunny(self, direct_url, title, quality=None, collection_id=None):
+        """Download from source and upload to Bunny in one pass (minimal disk use).
+
+        Streams chunk-by-chunk so a 500MB+ film does not fill Render temp disk.
+        """
+        if not direct_url.startswith("https://"):
+            raise ValueError("Only HTTPS direct media URLs are accepted")
+        if not self._looks_like_direct_media(direct_url):
+            raise RuntimeError(f"URL is not a direct media file: {direct_url[:120]}")
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+        }
+        # Open source stream first so we fail fast on bad links before creating a Bunny video.
+        src = requests.get(direct_url, stream=True, timeout=(20, 600), headers=headers, allow_redirects=True)
+        try:
+            src.raise_for_status()
+            content_type = (src.headers.get("Content-Type") or "").lower()
+            content_length = src.headers.get("Content-Length")
+            if "text/html" in content_type:
+                raise RuntimeError("Source returned HTML instead of a media file (not a direct link)")
+            # Some hosts omit content-type; still proceed if length is large enough.
+            if content_length and int(content_length) < 50_000:
+                raise RuntimeError(f"Source media is too small ({content_length} bytes)")
+
+            created = self.create_video(title, collection_id)
+            video_id = created.get("guid") or created.get("videoId")
+            if not video_id:
+                raise RuntimeError("Bunny did not return a video id")
+
+            def chunk_iter():
+                total = 0
+                for chunk in src.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    yield chunk
+                if total < 50_000:
+                    raise RuntimeError(f"Streamed media is too small ({total} bytes)")
+
+            try:
+                uploaded = self.upload_stream(
+                    chunk_iter(), video_id, quality,
+                    content_length=content_length,
+                )
+            except Exception:
+                try:
+                    self.delete_video(video_id)
+                except Exception:
+                    pass
+                raise
+
+            return {
+                "title": str(title)[:255],
+                "video_id": video_id,
+                "created": created,
+                "uploaded": uploaded,
+                "fetched_directly": False,
+                "accepted": True,
+                "encoding_pending": True,
+                "validation": {
+                    "source": "stream-upload",
+                    "content_type": content_type,
+                    "content_length": int(content_length) if content_length else None,
+                },
+                **self.playback(video_id),
+            }
+        finally:
+            src.close()
+
+    def server_download_and_upload(self, direct_url, title, quality=None, collection_name=None, temp_dir="/tmp/animehub"):
+        """Upload authorized media to Bunny.
+
+        Strategy (reliable for large lists on small hosts):
+        1. Optional short Bunny remote-fetch attempt (fast when the host allows Bunny).
+        2. Stream source → Bunny (no full file on disk) — main path for PixelDrain.
+        3. Last resort: download to temp then upload (only for smaller files / odd hosts).
         """
         if not direct_url.startswith("https://"):
             raise ValueError("Only HTTPS direct media URLs are accepted")
         collection = self.ensure_collection(collection_name) if collection_name else None
         collection_id = collection.get("guid") if collection else None
+
         existing = self.find_video(title, collection_id)
         if existing:
             video_id = existing.get("guid") or existing.get("videoId")
             storage = int(existing.get("storageSize") or existing.get("storage_size") or 0)
             status = existing.get("status")
-            # Reuse only videos that actually have content (skip prior Upload failed).
             if video_id and (storage > 0 or status in (2, 3, 4)):
-                return {"video_id": video_id, "created": existing,
-                        "deduplicated": True, "validation": {"source": "existing Bunny video"},
-                        **self.playback(video_id)}
+                return {
+                    "video_id": video_id,
+                    "created": existing,
+                    "deduplicated": True,
+                    "accepted": True,
+                    "validation": {"source": "existing Bunny video"},
+                    **self.playback(video_id),
+                }
             if video_id:
                 try:
                     self.delete_video(video_id)
                 except Exception:
                     pass
 
-        prefer_remote = os.getenv("BUNNY_REMOTE_FETCH", "true").strip().lower() in {"1", "true", "yes", "on"}
-        remote_error = None
+        errors = []
+        prefer_remote = os.getenv("BUNNY_REMOTE_FETCH", "false").strip().lower() in {"1", "true", "yes", "on"}
+        # Default is false: PixelDrain blocks Bunny fetchers; stream-upload is the reliable path.
         if prefer_remote:
             try:
                 return self.remote_fetch_and_wait(direct_url, title, quality, collection_id)
             except Exception as exc:
-                remote_error = str(exc)[:300]
-                # Fall through to server-side path.
+                errors.append(f"remote_fetch: {exc}")
 
+        try:
+            return self.stream_url_to_bunny(direct_url, title, quality, collection_id)
+        except Exception as exc:
+            errors.append(f"stream_upload: {exc}")
+
+        # Last resort: stage on disk (only practical for moderate sizes).
         os.makedirs(temp_dir, exist_ok=True)
         filename = hashlib.sha256(direct_url.encode()).hexdigest()[:24] + ".mp4"
         path = Path(temp_dir) / filename
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
                 "Accept": "*/*",
             }
             with requests.get(direct_url, stream=True, timeout=(20, 600), headers=headers, allow_redirects=True) as response:
@@ -358,16 +472,19 @@ class BunnyStreamProvider:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
                         if chunk:
                             output.write(chunk)
-            if path.stat().st_size < 50_000:
-                raise RuntimeError("Downloaded media is empty or too small")
             validation = self.validate_media(path)
-            if remote_error:
-                validation["remote_fetch_fallback"] = remote_error
             created = self.create_video(title, collection_id)
             video_id = created.get("guid") or created.get("videoId")
             if not video_id:
                 raise RuntimeError("Bunny did not return a video id")
-            uploaded = self.upload_file(path, video_id, quality)
+            try:
+                uploaded = self.upload_file(path, video_id, quality)
+            except Exception:
+                try:
+                    self.delete_video(video_id)
+                except Exception:
+                    pass
+                raise
             return {
                 "video_id": video_id,
                 "created": created,
@@ -375,8 +492,11 @@ class BunnyStreamProvider:
                 "fetched_directly": False,
                 "accepted": True,
                 "encoding_pending": True,
-                "validation": validation,
+                "validation": {**validation, "fallbacks": errors},
                 **self.playback(video_id),
             }
+        except Exception as exc:
+            errors.append(f"disk_upload: {exc}")
+            raise RuntimeError("All upload methods failed: " + " | ".join(errors)) from exc
         finally:
             path.unlink(missing_ok=True)
