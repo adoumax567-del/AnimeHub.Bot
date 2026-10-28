@@ -27,10 +27,11 @@ JOBS = JobManager()
 UPLOAD18 = Upload18Provider()
 BUNNY = BunnyStreamProvider()
 STORAGE_JOBS = {}
-# Searching and resolving can fan out, but staging several large media files at
-# once can exhaust Render's ephemeral disk. Keep the expensive download/upload
-# stage bounded while leaving the rest of the job concurrent.
-MEDIA_TRANSFER_SEMAPHORE = asyncio.Semaphore(2)
+# Searching/resolution can fan out, while the expensive media transfer stage is
+# bounded separately. Remote Bunny fetch normally avoids Render disk usage.
+MAX_WORK_CONCURRENCY = max(2, min(int(os.getenv("ANIMEHUB_MAX_WORK_CONCURRENCY", "8")), 8))
+MEDIA_TRANSFER_CONCURRENCY = max(1, min(int(os.getenv("ANIMEHUB_MEDIA_TRANSFER_CONCURRENCY", "4")), 4))
+MEDIA_TRANSFER_SEMAPHORE = asyncio.Semaphore(MEDIA_TRANSFER_CONCURRENCY)
 
 
 def _admin_token():
@@ -63,7 +64,7 @@ ADMIN_PAGE = r'''<!doctype html>
 <style>
 :root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e8eef7;background:#0b1220}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 90% 0,#173b52 0,#0b1220 42%);min-height:100vh}.shell{max-width:1180px;margin:auto;padding:28px 18px}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px}.brand{font-size:25px;font-weight:800}.muted{color:#9aadc2}.grid{display:grid;grid-template-columns:1.05fr .95fr;gap:18px}.card{background:rgba(19,31,49,.9);border:1px solid #263c55;border-radius:18px;padding:20px;box-shadow:0 16px 40px #0003}.card h2{margin:0 0 14px;font-size:18px}label{display:block;color:#b8c8d9;font-size:13px;margin:12px 0 6px}input,select,textarea{width:100%;border:1px solid #304963;background:#0d1a2b;color:#eef6ff;border-radius:10px;padding:11px;font:inherit}textarea{min-height:280px;resize:vertical;line-height:1.6}button{border:0;border-radius:10px;padding:11px 15px;background:#29b6a8;color:#04131b;font-weight:800;cursor:pointer}button.secondary{background:#20364e;color:#d7e7f6}button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:10px;align-items:end}.row>*{flex:1}.actions{display:flex;gap:10px;align-items:center;margin-top:14px}.hint{font-size:12px;color:#8ea4ba;line-height:1.6}.status{margin-top:14px;padding:12px;border-radius:10px;background:#102238;color:#bcd0e3}.job{padding:14px 0;border-bottom:1px solid #294057}.job:last-child{border-bottom:0}.jobtitle{font-weight:800}.pill{display:inline-block;border-radius:999px;padding:3px 9px;font-size:12px;margin-inline-start:6px;background:#24435b}.ok{background:#145244;color:#9cf0cf}.bad{background:#5a2630;color:#ffc2c8}.warn{background:#5a4721;color:#ffdc8a}.meter{height:7px;border-radius:99px;background:#20364b;overflow:hidden;margin:9px 0}.meter i{display:block;height:100%;background:#29b6a8}.item{font-size:13px;padding:7px 0;border-top:1px solid #23394e}.error{color:#ffb6bd;font-size:12px;margin-top:3px}.hide{display:none}@media(max-width:800px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
 </style></head><body><main class="shell"><header class="top"><div><div class="brand">AnimeHub<span style="color:#29b6a8">.Bot</span></div><div class="muted">مدير التنزيل المنظم · التنفيذ بالترتيب</div></div><button class="secondary" onclick="logout()">تسجيل الخروج</button></header>
-<section class="grid"><div class="card"><h2>إضافة قائمة جديدة</h2><label>القائمة</label><textarea id="list" placeholder="سطر لكل عمل، مثال:\nYour Name | فيلم\nNaruto | مسلسل | 720p | 1-12\nOne Piece | مسلسل | 720p | كل الحلقات"></textarea><div class="hint">الصيغة: الاسم | فيلم/مسلسل | الجودة اختيارية | النطاق اختيارياً. يمكن أيضاً لصق JSON من نوع items.</div><div class="row"><div><label>الجودة الافتراضية</label><select id="quality"><option>720p</option><option>1080p</option><option>480p</option><option>source</option></select></div><div><label>مكتبة Bunny</label><select id="library"><option value="">جاري تحميل المكتبات...</option></select></div></div><div class="status">وضع التنزيل مفعّل دائماً. يعمل النظام تلقائياً بعدد متوازٍ آمن يصل إلى 6 أعمال، مع معالجة الحلقات بالتوازي.</div><div class="actions"><button id="submit" onclick="submitList()">بدء التنزيل</button><span id="formStatus" class="hint"></span></div></div>
+<section class="grid"><div class="card"><h2>إضافة قائمة جديدة</h2><label>القائمة</label><textarea id="list" placeholder="سطر لكل عمل، مثال:\nYour Name | فيلم\nNaruto | مسلسل | 720p | 1-12\nOne Piece | مسلسل | 720p | كل الحلقات"></textarea><div class="hint">الصيغة: الاسم | فيلم/مسلسل | الجودة اختيارية | النطاق اختيارياً. يمكن أيضاً لصق JSON من نوع items.</div><div class="row"><div><label>الجودة الافتراضية</label><select id="quality"><option>720p</option><option>1080p</option><option>480p</option><option>source</option></select></div><div><label>مكتبة Bunny</label><select id="library"><option value="">جاري تحميل المكتبات...</option></select></div></div><div class="status">وضع التنزيل مفعّل دائماً. يعمل النظام تلقائياً حتى 8 أعمال بالتوازي وبحد أقصى 4 عمليات نقل إلى Bunny، ويضع كل عمل داخل Collection باسمه.</div><div class="actions"><button id="submit" onclick="submitList()">بدء التنزيل</button><span id="formStatus" class="hint"></span></div></div>
 <div class="card"><h2>قواعد التنفيذ</h2><div class="hint" style="font-size:14px;line-height:2">✓ يبدأ من أول عمل إلى آخر عمل<br>✓ يمنع تكرار نفس العمل داخل القائمة<br>✓ لا ينتقل للعمل التالي قبل إنهاء الحالي<br>✓ كل حلقة تسجل مكتملة أو فاشلة مع السبب<br>✓ التنزيل الخادمي يفحص الفيديو قبل رفعه<br>✓ ينظم كل عمل داخل Collection مستقلة في Bunny</div><div id="selected" class="status">لم تبدأ قائمة بعد.</div></div></section>
 <section class="card" style="margin-top:18px"><div class="top" style="margin-bottom:8px"><h2 style="margin:0">المهام والتقارير</h2><button class="secondary" onclick="refreshJobs()">تحديث</button></div><div id="jobs"><div class="muted">لا توجد مهام ظاهرة بعد.</div></div></section></main>
 <script>
@@ -506,10 +507,10 @@ async def create_job(payload: dict):
     for item in plan:
         item["mode"] = "download"
     ordered = bool(payload.get("ordered", False))
-    concurrency = 1 if ordered else min(6, max(2, len(plan)))
+    concurrency = 1 if ordered else min(MAX_WORK_CONCURRENCY, max(2, len(plan)))
     job = await JOBS.create(plan, resolve_plan_item, concurrency)
     return {"job_id": job["id"], "status": job["status"], "total": job["total"],
-            "concurrency": max(1, min(concurrency, 8)),
+            "concurrency": max(1, min(concurrency, MAX_WORK_CONCURRENCY)),
             "ordered": ordered, "deduplicated": deduplicated,
             "mode": "server_download",
             "message": "Use GET /v1/jobs/{job_id} to follow progress"}
