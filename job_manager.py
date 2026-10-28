@@ -80,14 +80,29 @@ class JobManager:
     def get(self, job_id):
         return self.jobs.get(job_id)
 
-    async def cancel_active(self):
-        """Cancel queued, running, or paused jobs before replacing them."""
-        cancelled = []
+    async def remove(self, job_id):
+        """Stop a job and remove its complete record and item details."""
+        task = self.tasks.get(job_id)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        existed = job_id in self.jobs
+        self.jobs.pop(job_id, None)
+        self.pause_events.pop(job_id, None)
+        self.tasks.pop(job_id, None)
+        return existed
+
+    async def remove_active(self):
+        """Remove queued, running, or paused jobs before replacing them."""
+        removed = []
         for job_id, job in list(self.jobs.items()):
             if job.get("status") in ("queued", "running", "paused"):
-                if await self.cancel(job_id):
-                    cancelled.append(job_id)
-        return cancelled
+                if await self.remove(job_id):
+                    removed.append(job_id)
+        return removed
 
     async def pause(self, job_id):
         job = self.jobs.get(job_id)
