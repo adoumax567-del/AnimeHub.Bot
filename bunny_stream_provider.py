@@ -11,13 +11,7 @@ import requests
 
 
 class BunnyStreamProvider:
-    """Bunny Stream client: pass true direct-download URLs into Bunny Fetch.
-
-    PixelDrain links from the catalog are already normalized to:
-      https://pixeldrain.com/api/file/{id}?download
-    Bunny often cannot pull that host itself, so we optionally wrap the same
-    direct URL behind a signed proxy on our public host, then call Bunny Fetch.
-    """
+    """Pass catalog direct-download URLs into Bunny Fetch (with optional proxy)."""
 
     def __init__(self):
         self.library_id = os.getenv("BUNNY_STREAM_LIBRARY_ID", "790172").strip()
@@ -83,7 +77,7 @@ class BunnyStreamProvider:
         if requested_id not in allowed:
             raise ValueError("Selected Bunny library is not configured")
         provider.library_id = requested_id
-        keys = __class__._load_library_map("BUNNY_STREAM_LIBRARY_KEYS")
+        keys = self._load_library_keys()
         provider.library_keys = keys
         provider.api_key = keys.get(requested_id) or self.api_key
         if not provider.api_key:
@@ -175,45 +169,44 @@ class BunnyStreamProvider:
             ),
         }
 
-    def wait_until_stored(self, video_id, timeout_seconds=400):
-        deadline = time.time() + max(30, min(int(timeout_seconds), 900))
+    def wait_until_stored(self, video_id, timeout_seconds=90):
+        """Poll until Bunny has bytes, or fail quickly (do not hang the job UI)."""
+        timeout_seconds = max(15, min(int(timeout_seconds), 300))
+        deadline = time.time() + timeout_seconds
         last = {}
         while time.time() < deadline:
             try:
                 last = self.video(video_id) or {}
             except Exception as exc:
                 last = {"_error": str(exc)}
-                time.sleep(5)
+                time.sleep(3)
                 continue
             status = last.get("status")
             storage = int(last.get("storageSize") or last.get("storage_size") or 0)
             length = int(last.get("length") or 0)
-            if storage > 0 or length > 0 or status in (2, 3, 4):
+            encode = int(last.get("encodeProgress") or 0)
+            # Real progress started
+            if storage > 0 or length > 0 or encode > 0 or status in (1, 2, 3, 4):
                 return last
             if status == 5:
-                raise RuntimeError(f"Bunny fetch/encode failed (status=5, storage={storage})")
-            time.sleep(5)
+                raise RuntimeError(f"Bunny failed (status=5, storage={storage})")
+            time.sleep(3)
         raise RuntimeError(
-            f"Bunny video still empty after fetch "
+            f"Bunny did not start receiving data within {timeout_seconds}s "
             f"(status={last.get('status')}, storage={last.get('storageSize') or 0})"
         )
 
-    # ---- direct-download URL helpers (same rules as data_manager.resolve_pd) ----
-
     @staticmethod
     def normalize_direct_download_url(url):
-        """Return a true direct-download URL, or None if not usable."""
         u = str(url or "").strip()
         if not u.startswith("https://"):
             return None
         lower = u.lower()
-        # PixelDrain: force API file download endpoint
         if "pixeldrain.com" in lower:
             m = re.search(r"(?:/u/|/api/file/|/l/)([a-zA-Z0-9]+)", u)
             if not m:
                 return None
-            file_id = m.group(1)
-            return f"https://pixeldrain.com/api/file/{file_id}?download"
+            return f"https://pixeldrain.com/api/file/{m.group(1)}?download"
         path = lower.split("?", 1)[0]
         if any(path.endswith(ext) for ext in (".mp4", ".mkv", ".webm", ".m4v")):
             return u
@@ -246,8 +239,28 @@ class BunnyStreamProvider:
         q = urllib.parse.urlencode({"u": media_url, "exp": exp, "sig": sig})
         return f"{base}/v1/storage/media-proxy?{q}"
 
-    def bunny_fetch(self, fetch_url, title, collection_id=None):
-        """Give Bunny a URL to pull. Returns (video_id, stored_meta)."""
+    def preflight_proxy(self, proxy_url):
+        """Quick check that our proxy endpoint responds (not a full download)."""
+        try:
+            # Range request: only first byte — proves route + signature + upstream open
+            r = requests.get(
+                proxy_url,
+                headers={"Range": "bytes=0-0", "User-Agent": "AnimeHub.Bot-Preflight/1.0"},
+                timeout=(10, 25),
+                stream=True,
+                allow_redirects=True,
+            )
+            # 200 or 206 are OK; 403/404 mean proxy misconfigured
+            if r.status_code in (200, 206):
+                r.close()
+                return True
+            body = (r.text or "")[:120]
+            r.close()
+            raise RuntimeError(f"proxy HTTP {r.status_code}: {body}")
+        except requests.RequestException as exc:
+            raise RuntimeError(f"proxy unreachable: {exc}") from exc
+
+    def bunny_fetch(self, fetch_url, title, collection_id=None, wait_seconds=90):
         body = {"url": fetch_url, "title": str(title)[:255]}
         params = {"collectionId": str(collection_id)} if collection_id else None
         response = None
@@ -259,8 +272,11 @@ class BunnyStreamProvider:
             )
             if response.status_code != 429 or attempt == 2:
                 break
-            time.sleep(2 ** attempt)
-        response.raise_for_status()
+            time.sleep(1 + attempt)
+        if response is None:
+            raise RuntimeError("Bunny fetch: no response")
+        if response.status_code >= 400:
+            raise RuntimeError(f"Bunny fetch HTTP {response.status_code}: {(response.text or '')[:200]}")
         accepted = response.json()
         if not isinstance(accepted, dict) or accepted.get("success") is not True:
             raise RuntimeError(
@@ -268,32 +284,22 @@ class BunnyStreamProvider:
             )
         video_id = accepted.get("guid") or accepted.get("videoId")
         if not video_id:
-            deadline = time.time() + 25
-            while time.time() < deadline and not video_id:
+            # Brief lookup only — do not hang
+            for _ in range(5):
                 time.sleep(2)
                 found = self.find_video(title, collection_id)
                 if found:
                     video_id = found.get("guid") or found.get("videoId")
+                    break
         if not video_id:
             raise RuntimeError("Bunny accepted fetch but returned no video id")
-        stored = self.wait_until_stored(
-            video_id, timeout_seconds=int(os.getenv("BUNNY_VERIFY_SECONDS", "400")),
-        )
+        stored = self.wait_until_stored(video_id, timeout_seconds=wait_seconds)
         return video_id, stored
 
     def server_download_and_upload(
         self, direct_url, title, quality=None, collection_name=None,
         temp_dir="/tmp/animehub", public_base=None,
     ):
-        """Use the source direct-download URL with Bunny Fetch (original design).
-
-        Steps:
-        1) Normalize to a real direct-download URL (PixelDrain API ?download).
-        2) Prefer Bunny Fetch of a signed proxy of that same URL (Bunny can reach us).
-        3) Else Bunny Fetch of the direct URL itself (works when host allows Bunny).
-        4) Verify storageSize > 0 before success.
-        5) Attach collection only after success.
-        """
         if not self.configured:
             raise RuntimeError("Bunny Stream is not configured")
 
@@ -301,7 +307,6 @@ class BunnyStreamProvider:
         if not direct:
             raise RuntimeError(f"Not a direct download URL: {str(direct_url)[:120]}")
 
-        # Reuse finished videos only
         existing = self.find_video(title, None)
         if existing:
             video_id = existing.get("guid") or existing.get("videoId")
@@ -334,20 +339,34 @@ class BunnyStreamProvider:
             except Exception:
                 pass
 
-        # Candidate fetch URLs: proxy(direct) first, then raw direct
+        base = (public_base or self.public_base or "").rstrip("/")
+        # Short waits so the admin UI does not sit on "uploading" forever
+        proxy_wait = int(os.getenv("BUNNY_PROXY_WAIT_SECONDS", "120"))
+        direct_wait = int(os.getenv("BUNNY_DIRECT_WAIT_SECONDS", "45"))
+
         candidates = []
-        proxy = self.build_proxy_url(direct, public_base=public_base)
-        if proxy:
-            candidates.append(("proxy", proxy))
-        candidates.append(("direct", direct))
-        # Also try PD without ?download (inline) — sometimes easier for fetchers
-        if "pixeldrain.com/api/file/" in direct and direct.endswith("?download"):
-            candidates.append(("direct_inline", direct.replace("?download", "")))
+        if base:
+            proxy = self.build_proxy_url(direct, public_base=base)
+            if proxy:
+                # Preflight so we fail in seconds if proxy/signature/env is wrong
+                try:
+                    self.preflight_proxy(proxy)
+                    candidates.append(("proxy", proxy, proxy_wait))
+                except Exception as pre_exc:
+                    errors.append(f"proxy_preflight: {pre_exc}")
+        else:
+            errors.append("proxy_skipped: set ANIMEHUB_PUBLIC_URL")
+
+        candidates.append(("direct", direct, direct_wait))
+        if direct.endswith("?download"):
+            candidates.append(("direct_inline", direct[:-9], direct_wait))
 
         last_video_id = None
-        for label, fetch_url in candidates:
+        for label, fetch_url, wait_s in candidates:
             try:
-                video_id, stored = self.bunny_fetch(fetch_url, title, collection_id)
+                video_id, stored = self.bunny_fetch(
+                    fetch_url, title, collection_id, wait_seconds=wait_s,
+                )
                 last_video_id = video_id
                 storage = int(stored.get("storageSize") or stored.get("storage_size") or 0)
                 if collection_name and not collection_id:
@@ -373,17 +392,13 @@ class BunnyStreamProvider:
                 }
             except Exception as exc:
                 errors.append(f"{label}: {exc}")
-                # Remove empty shell if created
                 if last_video_id:
                     try:
                         meta = self.video(last_video_id)
-                        if int(meta.get("storageSize") or 0) <= 0:
+                        if int(meta.get("storageSize") or meta.get("storage_size") or 0) <= 0:
                             self.delete_video(last_video_id)
                     except Exception:
                         pass
                     last_video_id = None
 
-        raise RuntimeError(
-            "Bunny could not pull the direct download URL. Tried: "
-            + " | ".join(errors)
-        )
+        raise RuntimeError("Upload did not start / Bunny pull failed: " + " | ".join(errors))
