@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -86,12 +87,32 @@ def direct_downloads(records):
 
 def select_links(records, quality=None, language=None):
     links = direct_downloads(records)
-    if quality:
-        q = quality.lower().replace(" ", "")
-        links = [r for r in links if str(r.get("quality", "")).lower().replace(" ", "") == q]
     if language:
         needle = language.lower()
         links = [r for r in links if needle in str(r.get("language", "")).lower()]
+    if quality and links:
+        requested = str(quality).lower().replace(" ", "")
+        # Keep non-numeric/source filters exact. Numeric qualities use the
+        # requested resolution first, then the nearest higher resolution, and
+        # finally the nearest lower resolution when no higher one exists.
+        if requested not in {"source", "auto", "best"}:
+            def resolution(value):
+                match = re.search(r"(\d{3,4})", str(value or ""))
+                return int(match.group(1)) if match else None
+            wanted = resolution(requested)
+            exact = [r for r in links if str(r.get("quality", "")).lower().replace(" ", "") == requested]
+            if exact:
+                links = exact
+            elif wanted is not None:
+                available = sorted({resolution(r.get("quality")) for r in links if resolution(r.get("quality"))})
+                higher = [value for value in available if value >= wanted]
+                chosen = min(higher) if higher else (max(available) if available else None)
+                if chosen is not None:
+                    links = [r for r in links if resolution(r.get("quality")) == chosen]
+                else:
+                    links = []
+            else:
+                links = [r for r in links if str(r.get("quality", "")).lower().replace(" ", "") == requested]
     return links
 
 
@@ -315,7 +336,8 @@ async def links(q: str = Query(..., min_length=1, max_length=200), episode: Opti
             "work": {"name": target.get("name"), "doc_ref": target.get("doc_ref"), "sources": target.get("sources", [])},
             "episode": {"number": selected.get("order"), "id": selected.get("id"), "name": selected.get("name")},
             "episode_count": episode_count, "direct_only": True, "downloadable_only": True,
-            "filters": {"quality": quality, "language": language}, "count": len(records),
+            "filters": {"quality": quality, "selected_quality": records[0].get("quality") if records else None,
+                        "language": language}, "count": len(records),
             "links": [public_link(r) for r in records]}
 
 
@@ -407,8 +429,10 @@ async def resolve_plan_item(item):
                 records = select_links(records, quality, language)
                 if not records:
                     raise LookupError("No direct downloadable link matched the requested filters")
+                selected_quality = records[0].get("quality") or quality or "source"
                 result = {"status": "completed", "work": target.get("name"), "episode": selected.get("order"),
-                          "episode_name": selected.get("name"), "links": [public_link(r) for r in records]}
+                          "episode_name": selected.get("name"), "requested_quality": quality or "720p",
+                          "selected_quality": selected_quality, "links": [public_link(r) for r in records]}
                 if str(item.get("mode", "links")).lower() == "download":
                     if not BUNNY.configured:
                         raise RuntimeError("Bunny Stream integration is not configured")
@@ -417,7 +441,7 @@ async def resolve_plan_item(item):
                     # cuts/editions may resolve to one canonical database title,
                     # and must remain distinguishable instead of being merged.
                     work_name = title or canonical_name
-                    episode_title = f"{work_name} - Episode {selected.get('order', number):02d} - {quality or 'source'}"
+                    episode_title = f"{work_name} - Episode {selected.get('order', number):02d} - {selected_quality}"
                     provider = BUNNY.for_library(item.get("library_id"))
                     attempts = []
                     stored = None
