@@ -7,12 +7,13 @@ import os
 import re
 import time
 import uuid
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from collections import defaultdict
 from typing import Optional
 from fastapi import FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from data_manager import DataManager
 from anime_slayer_provider import AnimeSlayerProvider
 from job_manager import JobManager
@@ -310,6 +311,56 @@ async def storage_libraries(request: Request):
     return {"provider": "Bunny Stream", "libraries": BUNNY.library_catalog}
 
 
+
+@app.get("/v1/storage/media-proxy")
+async def media_proxy(u: str = Query(...), exp: str = Query(...), sig: str = Query(...)):
+    """Signed stream proxy so Bunny Fetch can pull PixelDrain (and similar) via our host.
+
+    No admin cookie — Bunny servers call this URL. Auth is HMAC (exp+sig).
+    """
+    secret = (
+        os.getenv("ANIMEHUB_PROXY_SECRET")
+        or os.getenv("ANIMEHUB_ADMIN_SESSION_SECRET")
+        or os.getenv("BUNNY_STREAM_API_KEY")
+        or "animehub-proxy"
+    ).strip()
+    if not BunnyStreamProvider.verify_proxy(u, exp, sig, secret):
+        raise HTTPException(403, "Invalid or expired proxy signature")
+    if not u.startswith("https://"):
+        raise HTTPException(422, "Only HTTPS upstream URLs allowed")
+    # Block SSRF to internal networks — only allow known media hosts.
+    allowed = ("pixeldrain.com", "pd.cyou", "filemoon", "krakenfiles.com")
+    host = (u.split("/")[2] if "://" in u else "").lower()
+    if not any(host == a or host.endswith("." + a) for a in allowed):
+        # still allow direct .mp4 on https CDNs
+        if not any(u.lower().split("?")[0].endswith(ext) for ext in (".mp4", ".mkv", ".webm", ".m4v")):
+            raise HTTPException(403, f"Host not allowed for proxy: {host}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 AnimeHub.Bot-Proxy/1.0",
+        "Accept": "*/*",
+    }
+    try:
+        head = requests.get(u, stream=True, timeout=(20, 60), headers=headers, allow_redirects=True)
+        ctype = head.headers.get("Content-Type") or "video/mp4"
+        clen = head.headers.get("Content-Length")
+        head.close()
+    except Exception:
+        ctype, clen = "video/mp4", None
+
+    def stream():
+        with requests.get(u, stream=True, timeout=(30, 1200), headers=headers, allow_redirects=True) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(1024 * 1024):
+                if chunk:
+                    yield chunk
+
+    out_headers = {"Content-Type": ctype, "Cache-Control": "no-store"}
+    if clen:
+        out_headers["Content-Length"] = clen
+    return StreamingResponse(stream(), media_type=ctype, headers=out_headers)
+
+
 @app.post("/v1/storage/upload-url")
 async def storage_upload_url(payload: dict, request: Request):
     require_admin(request)
@@ -526,9 +577,15 @@ async def resolve_plan_item(item):
                         for record in group:
                             try:
                                 async with MEDIA_TRANSFER_SEMAPHORE:
+                                    public_base = (
+                                        os.getenv("ANIMEHUB_PUBLIC_URL")
+                                        or os.getenv("RENDER_EXTERNAL_URL")
+                                        or ""
+                                    ).rstrip("/")
                                     stored = await asyncio.to_thread(
                                         provider.server_download_and_upload,
                                         record["download_url"], episode_title, record.get("quality") or quality, work_name,
+                                        "/tmp/animehub", public_base or None,
                                     )
                                 result["canonical_work"] = canonical_name
                                 result["requested_title"] = title
