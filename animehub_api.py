@@ -436,7 +436,9 @@ async def resolve_plan_item(item):
                             result["requested_title"] = title
                             result["selected_source"] = record.get("name")
                             result["storage"] = stored
-                            result["verified"] = True
+                            result["accepted_by_bunny"] = bool(stored.get("accepted", True))
+                            result["encoding_pending"] = bool(stored.get("encoding_pending", False))
+                            result["verified"] = result["accepted_by_bunny"]
                             break
                         except Exception as source_exc:
                             attempts.append({

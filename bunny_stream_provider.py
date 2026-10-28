@@ -165,7 +165,12 @@ class BunnyStreamProvider:
             response.raise_for_status()
 
     def remote_fetch_and_wait(self, direct_url, title, quality=None, collection_id=None):
-        """Let Bunny fetch the HTTPS file directly, avoiding a Render disk hop."""
+        """Submit a Bunny fetch and return immediately after Bunny accepts it.
+
+        Bunny continues fetching/transcoding asynchronously. The API reports
+        acceptance, not encoding completion, so the next work can start at
+        once and the status can be checked later from Bunny.
+        """
         body = {"url": direct_url, "title": str(title)[:255]}
         if collection_id:
             body["collectionId"] = collection_id
@@ -180,23 +185,11 @@ class BunnyStreamProvider:
         video_id = created.get("guid") or created.get("videoId")
         if not video_id:
             raise RuntimeError("Bunny fetch did not return a video id")
-        deadline = time.time() + int(os.getenv("BUNNY_FETCH_TIMEOUT_SECONDS", "1800"))
-        try:
-            while time.time() < deadline:
-                current = self.video(video_id)
-                status = current.get("status")
-                progress = current.get("encodeProgress")
-                if status in (4, "4") and (progress is None or int(progress) >= 100):
-                    return {"video_id": video_id, "created": current, "fetched_directly": True,
-                            "validation": {"source": "Bunny remote fetch", "encodeProgress": progress},
-                            **self.playback(video_id)}
-                if status in (5, 6, "5", "6", "failed", "error"):
-                    raise RuntimeError(f"Bunny remote fetch failed with status {status}")
-                time.sleep(5)
-            raise TimeoutError("Bunny remote fetch encoding timed out")
-        except Exception:
-            self.delete_video(video_id)
-            raise
+        return {"video_id": video_id, "created": created, "fetched_directly": True,
+                "accepted": True, "encoding_pending": True,
+                "validation": {"source": "Bunny remote fetch accepted",
+                                "encodeProgress": created.get("encodeProgress")},
+                **self.playback(video_id)}
 
     def video(self, video_id):
         response = requests.get(self._url(f"/videos/{video_id}"), headers=self._headers(), timeout=30)
