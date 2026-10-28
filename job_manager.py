@@ -80,6 +80,15 @@ class JobManager:
     def get(self, job_id):
         return self.jobs.get(job_id)
 
+    async def cancel_active(self):
+        """Cancel queued, running, or paused jobs before replacing them."""
+        cancelled = []
+        for job_id, job in list(self.jobs.items()):
+            if job.get("status") in ("queued", "running", "paused"):
+                if await self.cancel(job_id):
+                    cancelled.append(job_id)
+        return cancelled
+
     async def pause(self, job_id):
         job = self.jobs.get(job_id)
         event = self.pause_events.get(job_id)
