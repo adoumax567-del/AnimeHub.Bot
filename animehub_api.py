@@ -160,7 +160,9 @@ def quality_fallback_groups(records, quality=None, max_groups=3):
     exact = [value for value in available if value == wanted]
     higher = [value for value in available if value > wanted]
     lower = [value for value in available if value < wanted]
-    order = exact + sorted(higher) + sorted(lower, reverse=True)
+    # Prefer lower resolutions after exact so constrained hosts (Render)
+    # can succeed with smaller files when 720p/1080p is too large/slow.
+    order = exact + sorted(lower, reverse=True) + sorted(higher)
     return [buckets[value] for value in order[:max_groups]]
 
 
