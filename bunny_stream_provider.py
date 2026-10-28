@@ -395,9 +395,10 @@ class BunnyStreamProvider:
         self, direct_url, title, quality=None, collection_name=None,
         temp_dir="/tmp/animehub", public_base=None,
     ):
-        """ONLY path: probe → download full file → create video → PUT → verify.
+        """Full-file bot transfer only: probe size → download complete file → PUT.
 
-        Never uses Bunny Fetch (that creates empty videos for PixelDrain).
+        Never uses Bunny Fetch (empty shells). Never streams partial bodies.
+        Refuses incomplete downloads so Bunny never gets a tiny stub file.
         """
         if not self.configured:
             raise RuntimeError("[config] Bunny not configured")
@@ -426,7 +427,6 @@ class BunnyStreamProvider:
                     "validation": {"source": "existing", "storageSize": storage},
                     **self.playback(video_id),
                 }
-            # stale empty shell with same title — remove
             if video_id and storage <= 0:
                 try:
                     self.delete_video(video_id)
@@ -443,48 +443,29 @@ class BunnyStreamProvider:
             size_hint = probe.get("size")
             max_bytes = int(os.getenv("ANIMEHUB_MAX_DOWNLOAD_BYTES", str(2_000_000_000)))
             if not size_hint or size_hint < 50_000:
-                raise RuntimeError(
-                    f"[download] cannot determine full file size (got {size_hint}); "
-                    "refusing partial upload"
-                )
+                raise RuntimeError(f"[download] unknown size ({size_hint}); refuse partial")
             if size_hint > max_bytes:
+                raise RuntimeError(f"[download] too large ({size_hint} > {max_bytes})")
+
+            stage = "download"
+            written, ctype, clen = self.download_direct(direct, path)
+            if written < size_hint * 0.98:
                 raise RuntimeError(
-                    f"[download] file too large for this host ({size_hint} > {max_bytes})"
+                    f"[download] incomplete {written}/{size_hint} — not uploading tiny file"
                 )
 
-            # Create video only after we know full size (never upload a tiny stub)
             stage = "create"
             created = self.create_video(title, collection_id=None)
             video_id = created.get("guid") or created.get("videoId")
 
-            # Preferred: stream source → Bunny in 1MB chunks until full size
             stage = "upload"
-            stream_err = None
-            try:
-                uploaded = self.stream_put_from_url(direct, video_id, size_hint, quality)
-                method = "chunk-stream-to-bunny"
-                written = size_hint
-                ctype = probe.get("content_type")
-            except Exception as exc:
-                stream_err = str(exc)
-                # Fallback: full download to disk then PUT (must match size)
-                stage = "download"
-                written, ctype, clen = self.download_direct(direct, path)
-                if written < size_hint * 0.98:
-                    raise RuntimeError(
-                        f"[download] incomplete file {written}/{size_hint} "
-                        f"(would produce tiny video)"
-                    )
-                stage = "upload"
-                uploaded = self.upload_file(path, video_id, quality)
-                method = "full-download-then-put"
-                uploaded = {**(uploaded or {}), "stream_fallback_error": stream_err}
+            uploaded = self.upload_file(path, video_id, quality)
 
             stage = "verify"
-            stored = self.wait_until_stored(video_id, timeout_seconds=150)
+            stored = self.wait_until_stored(video_id, timeout_seconds=120)
             storage = int(stored.get("storageSize") or stored.get("storage_size") or 0)
             if storage <= 0 and stored.get("status") not in (1, 2, 3, 4):
-                raise RuntimeError("[verify] Bunny storage still 0 after full upload")
+                raise RuntimeError("[verify] Bunny storage still 0")
 
             stage = "collection"
             if collection_name:
@@ -502,10 +483,9 @@ class BunnyStreamProvider:
                 "accepted": True,
                 "encoding_pending": stored.get("status") not in (3, 4),
                 "validation": {
-                    "source": "bot-chunk-or-full-put",
-                    "method": method,
+                    "source": "full-download-then-put",
                     "expected_bytes": size_hint,
-                    "transferred_bytes": written,
+                    "downloaded_bytes": written,
                     "content_type": ctype,
                     "bunny_storageSize": storage,
                     "bunny_status": stored.get("status"),
