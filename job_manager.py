@@ -49,7 +49,7 @@ class JobManager:
                 if job["status"] == "cancelled":
                     item["status"] = "cancelled"
                     return
-                item["status"] = "running"
+                item["status"] = "resolving"
                 try:
                     result = await resolver(item)
                     item["result"] = result
