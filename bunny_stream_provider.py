@@ -1,11 +1,8 @@
-"""Bunny Stream upload — official server path (no proxy).
+"""Bunny Stream — bot transfer without empty-shell videos.
 
-Bunny docs (https://docs.bunny.net/docs/stream-uploading-videos-through-our-http-api):
-  1) POST /library/{id}/videos          → create video, get guid
-  2) PUT  /library/{id}/videos/{guid}   → raw binary body (application/octet-stream)
-
-PixelDrain direct URLs work for *our* server download; Bunny Fetch often cannot
-pull them (blocked hosts). So we always: download on server → PUT to Bunny.
+Root cause of "stuck loading + no real video":
+  Bunny Fetch accepts PixelDrain URLs then fails → empty video / 0 B / missing file.
+  We never call Fetch. Only: download direct URL on this server → PUT binary to Bunny.
 """
 
 import hashlib
@@ -72,16 +69,13 @@ class BunnyStreamProvider:
         requested_id = str(library_id or self.library_id).strip()
         allowed = {str(e.get("id")).strip() for e in self.library_catalog}
         if requested_id not in allowed:
-            raise ValueError(f"[config] library {requested_id} not in BUNNY_STREAM_LIBRARIES")
+            raise ValueError(f"[config] library {requested_id} not configured")
         provider.library_id = requested_id
         keys = self._load_library_keys()
         provider.library_keys = keys
         provider.api_key = keys.get(requested_id) or self.api_key
         if not provider.api_key:
-            raise RuntimeError(
-                f"[config] missing API key for library {requested_id} "
-                f"(set BUNNY_STREAM_API_KEY or BUNNY_STREAM_LIBRARY_KEYS)"
-            )
+            raise RuntimeError(f"[config] no API key for library {requested_id}")
         provider.base_url = self.base_url
         provider.player_base = self.player_base
         provider.library_cdns = self.library_cdns
@@ -134,7 +128,7 @@ class BunnyStreamProvider:
             json={"name": clean}, timeout=30,
         )
         if r.status_code >= 400:
-            raise RuntimeError(f"[collection] create HTTP {r.status_code}: {(r.text or '')[:200]}")
+            raise RuntimeError(f"[collection] HTTP {r.status_code}: {(r.text or '')[:200]}")
         return r.json()
 
     def create_video(self, title, collection_id=None):
@@ -149,8 +143,9 @@ class BunnyStreamProvider:
         if r.status_code >= 400:
             raise RuntimeError(f"[create] HTTP {r.status_code}: {(r.text or '')[:250]}")
         data = r.json()
-        if not (data.get("guid") or data.get("videoId")):
-            raise RuntimeError(f"[create] no guid in response: {str(data)[:200]}")
+        vid = data.get("guid") or data.get("videoId")
+        if not vid:
+            raise RuntimeError(f"[create] no guid: {str(data)[:200]}")
         return data
 
     def set_video_collection(self, video_id, collection_id):
@@ -163,7 +158,7 @@ class BunnyStreamProvider:
             timeout=30,
         )
         if r.status_code not in (200, 204):
-            raise RuntimeError(f"[collection] attach HTTP {r.status_code}: {(r.text or '')[:200]}")
+            raise RuntimeError(f"[collection] attach HTTP {r.status_code}")
 
     def delete_video(self, video_id):
         r = requests.delete(self._url(f"/videos/{video_id}"), headers=self._headers(), timeout=30)
@@ -173,7 +168,7 @@ class BunnyStreamProvider:
     def video(self, video_id):
         r = requests.get(self._url(f"/videos/{video_id}"), headers=self._headers(), timeout=30)
         if r.status_code >= 400:
-            raise RuntimeError(f"[verify] get video HTTP {r.status_code}: {(r.text or '')[:200]}")
+            raise RuntimeError(f"[verify] HTTP {r.status_code}: {(r.text or '')[:200]}")
         return r.json()
 
     def playback(self, video_id):
@@ -186,13 +181,11 @@ class BunnyStreamProvider:
         }
 
     def upload_file(self, path, video_id, quality=None):
-        """Official Bunny binary upload (PUT raw octets)."""
         path = Path(path)
         size = path.stat().st_size if path.is_file() else 0
         if size < 50_000:
-            raise ValueError(f"[upload] file too small ({size} bytes)")
+            raise ValueError(f"[upload] file too small ({size})")
         params = {}
-        # enabledResolutions expects values like 720p per docs
         if quality:
             q = str(quality).strip()
             if q.isdigit():
@@ -216,20 +209,20 @@ class BunnyStreamProvider:
         try:
             body = r.json() if r.content else {}
         except ValueError:
-            body = {"raw": (r.text or "")[:120]}
+            body = {}
         if isinstance(body, dict) and body.get("success") is False:
-            raise RuntimeError(f"[upload] Bunny rejected: {body.get('message') or body}")
-        return body or {"success": True, "statusCode": r.status_code, "bytes": size}
+            raise RuntimeError(f"[upload] rejected: {body.get('message')}")
+        return body or {"success": True, "bytes": size}
 
-    def wait_until_stored(self, video_id, timeout_seconds=180):
-        deadline = time.time() + max(20, min(int(timeout_seconds), 600))
+    def wait_until_stored(self, video_id, timeout_seconds=120):
+        deadline = time.time() + max(15, min(int(timeout_seconds), 300))
         last = {}
         while time.time() < deadline:
             try:
                 last = self.video(video_id) or {}
             except Exception as exc:
                 last = {"_error": str(exc)}
-                time.sleep(4)
+                time.sleep(3)
                 continue
             status = last.get("status")
             storage = int(last.get("storageSize") or last.get("storage_size") or 0)
@@ -238,10 +231,10 @@ class BunnyStreamProvider:
             if storage > 0 or length > 0 or progress > 0 or status in (1, 2, 3, 4):
                 return last
             if status == 5:
-                raise RuntimeError("[verify] Bunny status=5 (encoding/upload failed)")
-            time.sleep(4)
+                raise RuntimeError("[verify] Bunny status=5 failed")
+            time.sleep(3)
         raise RuntimeError(
-            f"[verify] storage still 0 after {timeout_seconds}s "
+            f"[verify] still empty after upload "
             f"(status={last.get('status')}, storage={last.get('storageSize') or 0})"
         )
 
@@ -263,12 +256,40 @@ class BunnyStreamProvider:
             return u
         return None
 
+    def probe_direct(self, direct_url):
+        """HEAD/Range probe — know size before long download."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Range": "bytes=0-0",
+        }
+        r = requests.get(direct_url, headers=headers, timeout=(15, 30), stream=True, allow_redirects=True)
+        try:
+            if r.status_code not in (200, 206):
+                raise RuntimeError(f"[download] probe HTTP {r.status_code}")
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if "text/html" in ctype:
+                raise RuntimeError("[download] probe got HTML, not media")
+            # Content-Range: bytes 0-0/TOTAL
+            total = None
+            cr = r.headers.get("Content-Range") or ""
+            if "/" in cr:
+                try:
+                    total = int(cr.rsplit("/", 1)[-1])
+                except ValueError:
+                    total = None
+            if total is None and r.headers.get("Content-Length"):
+                try:
+                    total = int(r.headers["Content-Length"])
+                except ValueError:
+                    total = None
+            return {"content_type": ctype, "size": total}
+        finally:
+            r.close()
+
     def download_direct(self, direct_url, dest_path):
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             "Accept": "*/*",
         }
         dest_path = Path(dest_path)
@@ -277,7 +298,7 @@ class BunnyStreamProvider:
         for attempt in range(2):
             try:
                 with requests.get(
-                    direct_url, stream=True, timeout=(30, 1200),
+                    direct_url, stream=True, timeout=(30, 1800),
                     headers=headers, allow_redirects=True,
                 ) as resp:
                     if resp.status_code >= 400:
@@ -285,7 +306,7 @@ class BunnyStreamProvider:
                     ctype = (resp.headers.get("Content-Type") or "").lower()
                     clen = resp.headers.get("Content-Length")
                     if "text/html" in ctype:
-                        raise RuntimeError(f"HTML not media (Content-Type={ctype})")
+                        raise RuntimeError(f"HTML not media ({ctype})")
                     written = 0
                     with dest_path.open("wb") as out:
                         for chunk in resp.iter_content(1024 * 1024):
@@ -295,10 +316,9 @@ class BunnyStreamProvider:
                 if written < 50_000:
                     dest_path.unlink(missing_ok=True)
                     raise RuntimeError(f"too small ({written} bytes)")
-                if clen and abs(int(clen) - written) > max(1024, int(clen) * 0.01):
-                    # incomplete download
+                if clen and abs(int(clen) - written) > max(2048, int(clen) * 0.02):
                     dest_path.unlink(missing_ok=True)
-                    raise RuntimeError(f"incomplete {written}/{clen} bytes")
+                    raise RuntimeError(f"incomplete {written}/{clen}")
                 return written, ctype, clen
             except Exception as exc:
                 last_err = exc
@@ -306,69 +326,81 @@ class BunnyStreamProvider:
                 if attempt == 0:
                     time.sleep(2)
                     continue
-                raise RuntimeError(f"[download] {direct_url[:80]} → {last_err}") from last_err
-        raise RuntimeError(f"[download] failed: {last_err}")
+                raise RuntimeError(f"[download] {str(direct_url)[:90]} → {last_err}") from last_err
+        raise RuntimeError(f"[download] {last_err}")
 
 
-    def fetch_from_url(self, source_url, title, collection_id=None, extra_headers=None):
-        """Bot-style remote pull: tell Bunny to download the direct URL (with browser headers).
+    def stream_put_from_url(self, direct_url, video_id, content_length, quality=None):
+        """Pipe source → Bunny in chunks until full content_length is sent.
 
-        Used by bots/scripts that want 'transfer by URL' without proxy.
-        Library-level endpoint: POST /videos/fetch
-        Body may include headers so hosts like PixelDrain accept the request.
+        Avoids tiny incomplete files: Bunny gets continuous 1MB chunks until total matches.
         """
-        body = {
-            "url": source_url,
-            "title": str(title)[:255],
-            "headers": extra_headers or {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "*/*",
-                "Referer": "https://pixeldrain.com/",
-            },
+        if not content_length or int(content_length) < 50_000:
+            raise RuntimeError(f"[upload] invalid content_length={content_length}")
+        content_length = int(content_length)
+        params = {}
+        if quality:
+            q = str(quality).strip()
+            if q.isdigit():
+                q = f"{q}p"
+            if re.fullmatch(r"\d{3,4}p", q, re.I):
+                params["enabledResolutions"] = q.lower()
+
+        headers_src = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
         }
-        params = {"collectionId": str(collection_id)} if collection_id else None
-        r = requests.post(
-            self._url("/videos/fetch"),
-            headers={**self._headers(), "Content-Type": "application/json"},
+
+        def body_generator():
+            sent = 0
+            with requests.get(
+                direct_url, stream=True, timeout=(30, 1800),
+                headers=headers_src, allow_redirects=True,
+            ) as src:
+                if src.status_code >= 400:
+                    raise RuntimeError(f"[download] stream HTTP {src.status_code}")
+                ctype = (src.headers.get("Content-Type") or "").lower()
+                if "text/html" in ctype:
+                    raise RuntimeError("[download] stream got HTML")
+                for chunk in src.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    sent += len(chunk)
+                    yield chunk
+            if sent < content_length * 0.98:
+                raise RuntimeError(f"[download] stream incomplete {sent}/{content_length}")
+
+        r = requests.put(
+            self._url(f"/videos/{video_id}"),
+            headers={
+                **self._headers(),
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(content_length),
+            },
             params=params,
-            json=body,
-            timeout=60,
+            data=body_generator(),
+            timeout=(60, 3600),
         )
         if r.status_code >= 400:
-            raise RuntimeError(f"[fetch] HTTP {r.status_code}: {(r.text or '')[:250]}")
-        data = r.json() if r.content else {}
-        if isinstance(data, dict) and data.get("success") is False:
-            raise RuntimeError(f"[fetch] rejected: {data.get('message') or data}")
-        video_id = None
-        if isinstance(data, dict):
-            video_id = data.get("guid") or data.get("videoId")
-        if not video_id:
-            # Accept-only response: locate by title briefly
-            for _ in range(6):
-                time.sleep(2)
-                found = self.find_video(title, collection_id)
-                if found:
-                    video_id = found.get("guid") or found.get("videoId")
-                    break
-        if not video_id:
-            raise RuntimeError("[fetch] accepted but no video id returned")
-        stored = self.wait_until_stored(video_id, timeout_seconds=90)
-        return video_id, stored, data
+            raise RuntimeError(f"[upload] stream PUT HTTP {r.status_code}: {(r.text or '')[:250]}")
+        try:
+            body = r.json() if r.content else {}
+        except ValueError:
+            body = {}
+        if isinstance(body, dict) and body.get("success") is False:
+            raise RuntimeError(f"[upload] rejected: {body.get('message')}")
+        return {"success": True, "bytes": content_length, "mode": "chunk-stream"}
 
     def server_download_and_upload(
         self, direct_url, title, quality=None, collection_name=None,
         temp_dir="/tmp/animehub", public_base=None,
     ):
-        """Server-only: download direct URL → create video → PUT binary → verify.
+        """ONLY path: probe → download full file → create video → PUT → verify.
 
-        Errors are tagged: [config] [download] [create] [upload] [verify] [collection]
-        so the admin panel shows the exact failing stage.
+        Never uses Bunny Fetch (that creates empty videos for PixelDrain).
         """
         if not self.configured:
-            raise RuntimeError("[config] Bunny not configured (library id / API key)")
+            raise RuntimeError("[config] Bunny not configured")
 
         direct = self.normalize_direct_download_url(direct_url)
         if not direct:
@@ -394,64 +426,65 @@ class BunnyStreamProvider:
                     "validation": {"source": "existing", "storageSize": storage},
                     **self.playback(video_id),
                 }
+            # stale empty shell with same title — remove
+            if video_id and storage <= 0:
+                try:
+                    self.delete_video(video_id)
+                except Exception:
+                    pass
 
-        errors = []
-        collection_id = None
-        if collection_name:
-            try:
-                for c in self.list_collections() or []:
-                    if str(c.get("name", "")).casefold() == str(collection_name).strip().casefold():
-                        collection_id = c.get("guid")
-                        break
-            except Exception:
-                pass
-
-        # --- Path A: bot remote transfer (Bunny Fetch + browser headers) ---
-        # Same idea as Telegram URL-uploader bots + Bunny advanced fetch headers.
-        try:
-            video_id, stored, accepted = self.fetch_from_url(direct, title, collection_id)
-            storage = int(stored.get("storageSize") or stored.get("storage_size") or 0)
-            if collection_name and not collection_id:
-                col = self.ensure_collection(collection_name)
-                self.set_video_collection(video_id, col.get("guid"))
-            return {
-                "title": str(title)[:255],
-                "video_id": video_id,
-                "direct_url": direct,
-                "fetched_directly": True,
-                "accepted": True,
-                "encoding_pending": stored.get("status") not in (3, 4),
-                "validation": {
-                    "source": "bot-fetch-with-headers",
-                    "method": "Bunny Fetch + User-Agent/Referer (bot direct transfer)",
-                    "bunny_storageSize": storage,
-                    "bunny_status": stored.get("status"),
-                },
-                **self.playback(video_id),
-            }
-        except Exception as exc:
-            errors.append(str(exc))
-
-        # --- Path B: bot local transfer (download on server then PUT) ---
-        # Same pattern as URL-uploader bots: bot downloads, then uploads destination.
         path = Path(temp_dir or "/tmp/animehub") / (
             hashlib.sha256(direct.encode()).hexdigest()[:24] + ".mp4"
         )
         video_id = None
-        stage = "download"
+        stage = "probe"
         try:
-            written, ctype, clen = self.download_direct(direct, path)
+            probe = self.probe_direct(direct)
+            size_hint = probe.get("size")
+            max_bytes = int(os.getenv("ANIMEHUB_MAX_DOWNLOAD_BYTES", str(2_000_000_000)))
+            if not size_hint or size_hint < 50_000:
+                raise RuntimeError(
+                    f"[download] cannot determine full file size (got {size_hint}); "
+                    "refusing partial upload"
+                )
+            if size_hint > max_bytes:
+                raise RuntimeError(
+                    f"[download] file too large for this host ({size_hint} > {max_bytes})"
+                )
 
+            # Create video only after we know full size (never upload a tiny stub)
             stage = "create"
             created = self.create_video(title, collection_id=None)
             video_id = created.get("guid") or created.get("videoId")
 
+            # Preferred: stream source → Bunny in 1MB chunks until full size
             stage = "upload"
-            uploaded = self.upload_file(path, video_id, quality)
+            stream_err = None
+            try:
+                uploaded = self.stream_put_from_url(direct, video_id, size_hint, quality)
+                method = "chunk-stream-to-bunny"
+                written = size_hint
+                ctype = probe.get("content_type")
+            except Exception as exc:
+                stream_err = str(exc)
+                # Fallback: full download to disk then PUT (must match size)
+                stage = "download"
+                written, ctype, clen = self.download_direct(direct, path)
+                if written < size_hint * 0.98:
+                    raise RuntimeError(
+                        f"[download] incomplete file {written}/{size_hint} "
+                        f"(would produce tiny video)"
+                    )
+                stage = "upload"
+                uploaded = self.upload_file(path, video_id, quality)
+                method = "full-download-then-put"
+                uploaded = {**(uploaded or {}), "stream_fallback_error": stream_err}
 
             stage = "verify"
-            stored = self.wait_until_stored(video_id, timeout_seconds=180)
+            stored = self.wait_until_stored(video_id, timeout_seconds=150)
             storage = int(stored.get("storageSize") or stored.get("storage_size") or 0)
+            if storage <= 0 and stored.get("status") not in (1, 2, 3, 4):
+                raise RuntimeError("[verify] Bunny storage still 0 after full upload")
 
             stage = "collection"
             if collection_name:
@@ -469,14 +502,13 @@ class BunnyStreamProvider:
                 "accepted": True,
                 "encoding_pending": stored.get("status") not in (3, 4),
                 "validation": {
-                    "source": "bot-download-then-put",
-                    "method": "server download + Bunny PUT binary",
-                    "downloaded_bytes": written,
+                    "source": "bot-chunk-or-full-put",
+                    "method": method,
+                    "expected_bytes": size_hint,
+                    "transferred_bytes": written,
                     "content_type": ctype,
-                    "content_length": clen,
                     "bunny_storageSize": storage,
                     "bunny_status": stored.get("status"),
-                    "prior_fetch_errors": errors,
                 },
                 **self.playback(video_id),
             }
@@ -484,8 +516,6 @@ class BunnyStreamProvider:
             msg = str(exc)
             if not msg.startswith("["):
                 msg = f"[{stage}] {msg}"
-            if errors:
-                msg = msg + " | fetch_tried: " + " ; ".join(errors)
             if video_id:
                 try:
                     meta = self.video(video_id)
