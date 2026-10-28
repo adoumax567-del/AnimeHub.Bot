@@ -31,7 +31,10 @@ class JobManager:
         event = asyncio.Event()
         event.set()
         self.pause_events[job_id] = event
-        self.tasks[job_id] = asyncio.create_task(self._run(job_id, resolver, max(1, min(concurrency, 8))))
+        # Create one lightweight async task per submitted work. Expensive
+        # Bunny submissions remain bounded by the global transfer semaphore in
+        # the API, while the complete list can resolve and queue immediately.
+        self.tasks[job_id] = asyncio.create_task(self._run(job_id, resolver, max(1, int(concurrency))))
         return self.jobs[job_id]
 
     async def _run(self, job_id, resolver, concurrency):
