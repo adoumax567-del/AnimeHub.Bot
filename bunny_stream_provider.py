@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -20,6 +21,32 @@ class BunnyStreamProvider:
         self.player_base = os.getenv("BUNNY_STREAM_PLAYER_BASE", "https://iframe.mediadelivery.net/embed").rstrip("/")
         self.library_name = os.getenv("BUNNY_STREAM_LIBRARY_NAME", self.library_id).strip()
         self.library_catalog = self._load_library_catalog()
+        self.library_keys = self._load_library_keys()
+        self.library_cdns = self._load_library_map("BUNNY_STREAM_LIBRARY_CDNS")
+
+    @staticmethod
+    def _load_library_map(name):
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return {str(key).strip(): str(value).strip() for key, value in data.items()
+                if str(key).strip() and str(value).strip()}
+
+    def _load_library_keys(self):
+        """Load per-library write keys from a JSON environment secret."""
+        raw = os.getenv("BUNNY_STREAM_LIBRARY_KEYS", "").strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return {str(key).strip(): str(value).strip() for key, value in data.items()
+                if str(key).strip() and str(value).strip()}
 
     def _load_library_catalog(self):
         """Load selectable libraries as id:name pairs without exposing API keys."""
@@ -42,10 +69,13 @@ class BunnyStreamProvider:
         """Return an isolated provider instance for a selected Bunny library."""
         provider = BunnyStreamProvider()
         provider.library_id = str(library_id or self.library_id).strip()
-        provider.api_key = self.api_key
+        provider.api_key = provider.library_keys.get(provider.library_id) or self.library_keys.get(provider.library_id) or self.api_key
         provider.base_url = self.base_url
         provider.cdn_hostname = self.cdn_hostname
         provider.player_base = self.player_base
+        provider.library_keys = self.library_keys
+        provider.library_cdns = self.library_cdns
+        provider.cdn_hostname = provider.library_cdns.get(provider.library_id, provider.cdn_hostname)
         return provider
 
     def _headers(self):

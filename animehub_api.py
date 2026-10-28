@@ -485,6 +485,17 @@ async def create_job(payload: dict):
         unique_plan.append(item)
     deduplicated = len(plan) - len(unique_plan)
     plan = unique_plan
+    # Split the ordered list into two halves: first half alternates across
+    # libraries 1/2, second half alternates across libraries 3/4. An explicit
+    # library_id always wins and is never overwritten.
+    movie_libraries = [entry["id"] for entry in BUNNY.library_catalog[:4]]
+    if len(movie_libraries) >= 4:
+        midpoint = (len(plan) + 1) // 2
+        for index, item in enumerate(plan):
+            if item.get("library_id"):
+                continue
+            pair = movie_libraries[:2] if index < midpoint else movie_libraries[2:4]
+            item["library_id"] = pair[index % 2]
     try:
         for item in plan:
             expand_plan_item(item)
@@ -495,7 +506,7 @@ async def create_job(payload: dict):
     for item in plan:
         item["mode"] = "download"
     ordered = bool(payload.get("ordered", False))
-    concurrency = 1 if ordered else 6
+    concurrency = 1 if ordered else min(6, max(2, len(plan)))
     job = await JOBS.create(plan, resolve_plan_item, concurrency)
     return {"job_id": job["id"], "status": job["status"], "total": job["total"],
             "concurrency": max(1, min(concurrency, 8)),
