@@ -9,6 +9,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from collections import defaultdict
 from typing import Optional
 from fastapi import FastAPI, Form, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -28,6 +29,9 @@ JOBS = JobManager()
 UPLOAD18 = Upload18Provider()
 BUNNY = BunnyStreamProvider()
 STORAGE_JOBS = {}
+LOGIN_FAILURES = defaultdict(list)
+MAX_LOGIN_FAILURES = 8
+LOGIN_WINDOW_SECONDS = 300
 # Searching/resolution can fan out, while the expensive media transfer stage is
 # bounded separately. Remote Bunny fetch normally avoids Render disk usage.
 # Every submitted work gets its own async task. The Bunny submission stage is
@@ -59,6 +63,23 @@ def _admin_authenticated(request):
         return time.time() - issued < 86400
     except Exception:
         return False
+
+
+def require_admin(request: Request):
+    if not _admin_authenticated(request):
+        raise HTTPException(401, "Admin authentication required")
+
+
+def _login_allowed(request):
+    now = time.time()
+    key = request.client.host if request.client else "unknown"
+    LOGIN_FAILURES[key] = [stamp for stamp in LOGIN_FAILURES[key] if now - stamp < LOGIN_WINDOW_SECONDS]
+    return len(LOGIN_FAILURES[key]) < MAX_LOGIN_FAILURES
+
+
+def _record_login_failure(request):
+    key = request.client.host if request.client else "unknown"
+    LOGIN_FAILURES[key].append(time.time())
 
 
 ADMIN_PAGE = r'''<!doctype html>
@@ -224,17 +245,27 @@ async def admin_page(request: Request):
     if not ADMIN_PASSWORD or not ADMIN_SESSION_SECRET:
         return HTMLResponse("Admin page is not configured. Set ANIMEHUB_ADMIN_PASSWORD and ANIMEHUB_ADMIN_SESSION_SECRET.", status_code=503)
     if _admin_authenticated(request):
-        return HTMLResponse(ADMIN_PAGE)
-    return HTMLResponse(LOGIN_PAGE.replace("{ERROR}", ""))
+        response = HTMLResponse(ADMIN_PAGE)
+    else:
+        response = HTMLResponse(LOGIN_PAGE.replace("{ERROR}", ""))
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @app.post("/admin/login", response_class=HTMLResponse)
 async def admin_login(request: Request, password: str = Form(...)):
     if not ADMIN_PASSWORD or not ADMIN_SESSION_SECRET:
         return HTMLResponse("Admin page is not configured.", status_code=503)
+    if not _login_allowed(request):
+        return HTMLResponse("محاولات دخول كثيرة. حاول بعد دقائق.", status_code=429)
     if not hmac.compare_digest(password, ADMIN_PASSWORD):
+        _record_login_failure(request)
         return HTMLResponse(LOGIN_PAGE.replace("{ERROR}", "<div class='err'>كلمة المرور غير صحيحة.</div>"), status_code=401)
     response = RedirectResponse("/admin", status_code=303)
+    LOGIN_FAILURES.pop(request.client.host if request.client else "unknown", None)
     response.set_cookie("animehub_admin", _admin_token(), max_age=86400, httponly=True,
                         secure=request.url.scheme == "https", samesite="lax")
     return response
@@ -261,27 +292,29 @@ async def sources():
 
 @app.get("/v1/jobs")
 async def list_jobs(request: Request):
-    if not _admin_authenticated(request):
-        raise HTTPException(401, "Admin authentication required")
+    require_admin(request)
     return {"jobs": list(JOBS.jobs.values())}
 
 
 @app.get("/v1/storage/status")
-async def storage_status():
+async def storage_status(request: Request):
+    require_admin(request)
     return {"provider": "Bunny Stream", "configured": BUNNY.configured,
             "library_id": BUNNY.library_id, "cdn_configured": bool(BUNNY.cdn_hostname),
             "secret_exposed": False}
 
 
 @app.get("/v1/storage/libraries")
-async def storage_libraries():
+async def storage_libraries(request: Request):
+    require_admin(request)
     if not BUNNY.configured:
         raise HTTPException(503, "Bunny Stream integration is not configured")
     return {"provider": "Bunny Stream", "libraries": BUNNY.library_catalog}
 
 
 @app.post("/v1/storage/upload-url")
-async def storage_upload_url(payload: dict):
+async def storage_upload_url(payload: dict, request: Request):
+    require_admin(request)
     video_url = str(payload.get("video_url", "")).strip()
     if not video_url.startswith("https://"):
         raise HTTPException(422, "video_url must be an HTTPS direct media URL")
@@ -295,7 +328,8 @@ async def storage_upload_url(payload: dict):
 
 
 @app.post("/v1/storage/download-and-upload")
-async def storage_download_and_upload(payload: dict):
+async def storage_download_and_upload(payload: dict, request: Request):
+    require_admin(request)
     """Download an authorized direct file on the server, validate it, then upload it."""
     direct_url = str(payload.get("direct_url", "")).strip()
     if not direct_url.startswith("https://"):
@@ -331,7 +365,8 @@ async def storage_download_and_upload(payload: dict):
 
 
 @app.get("/v1/storage/jobs/{job_id}")
-async def storage_job_status(job_id: str):
+async def storage_job_status(job_id: str, request: Request):
+    require_admin(request)
     job = STORAGE_JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Storage job not found")
@@ -535,16 +570,25 @@ async def resolve_plan_item(item):
 
 
 @app.post("/v1/jobs")
-async def create_job(payload: dict):
+async def create_job(payload: dict, request: Request):
+    require_admin(request)
     plan = payload.get("items") or payload.get("list")
     if not isinstance(plan, list) or not plan:
         raise HTTPException(422, "items must be a non-empty list")
+    if len(plan) > 1000:
+        raise HTTPException(413, "A single list cannot contain more than 1000 works")
     # Preserve the first occurrence and drop repeated works before scheduling.
     # This keeps the user-facing order deterministic and prevents duplicate uploads.
     unique_plan, seen = [], set()
     for item in plan:
         if not isinstance(item, dict):
             raise HTTPException(422, "each item must be an object")
+        title = str(item.get("title", "")).strip()
+        if not title or len(title) > 300:
+            raise HTTPException(422, "each title must contain 1 to 300 characters")
+        item["title"] = title
+        if isinstance(item.get("episodes"), list) and len(item["episodes"]) > 100:
+            raise HTTPException(422, "an item cannot contain more than 100 episodes")
         # Same-name works can be different MAL entries, years, cuts, or
         # seasons. Only collapse an actually identical request.
         identity_fields = ("mal_id", "myanimelist_id", "year", "season", "version", "edition", "quality", "language")
@@ -561,10 +605,13 @@ async def create_job(payload: dict):
     # library, use the first configured library as a safe default; never split
     # one list across libraries automatically.
     movie_libraries = [entry["id"] for entry in BUNNY.library_catalog[:4]]
+    allowed_libraries = set(movie_libraries)
     if movie_libraries:
         for item in plan:
             if not item.get("library_id"):
                 item["library_id"] = movie_libraries[0]
+            elif str(item["library_id"]) not in allowed_libraries:
+                raise HTTPException(422, "library_id is not configured for this service")
     try:
         for item in plan:
             expand_plan_item(item)
@@ -587,7 +634,8 @@ async def create_job(payload: dict):
 
 
 @app.get("/v1/jobs/{job_id}")
-async def get_job(job_id: str):
+async def get_job(job_id: str, request: Request):
+    require_admin(request)
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
@@ -604,7 +652,8 @@ async def library_plan(payload: dict):
 
 
 @app.post("/v1/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
+async def cancel_job(job_id: str, request: Request):
+    require_admin(request)
     if not JOBS.get(job_id):
         raise HTTPException(404, "Job not found")
     cancelled = await JOBS.cancel(job_id)
@@ -612,7 +661,8 @@ async def cancel_job(job_id: str):
 
 
 @app.delete("/v1/jobs/{job_id}")
-async def delete_job(job_id: str):
+async def delete_job(job_id: str, request: Request):
+    require_admin(request)
     if not JOBS.get(job_id):
         raise HTTPException(404, "Job not found")
     deleted = await JOBS.remove(job_id)
@@ -620,7 +670,8 @@ async def delete_job(job_id: str):
 
 
 @app.post("/v1/jobs/{job_id}/pause")
-async def pause_job(job_id: str):
+async def pause_job(job_id: str, request: Request):
+    require_admin(request)
     if not JOBS.get(job_id):
         raise HTTPException(404, "Job not found")
     paused = await JOBS.pause(job_id)
@@ -628,7 +679,8 @@ async def pause_job(job_id: str):
 
 
 @app.post("/v1/jobs/{job_id}/resume")
-async def resume_job(job_id: str):
+async def resume_job(job_id: str, request: Request):
+    require_admin(request)
     if not JOBS.get(job_id):
         raise HTTPException(404, "Job not found")
     resumed = await JOBS.resume(job_id)

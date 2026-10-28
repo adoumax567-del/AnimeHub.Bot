@@ -68,7 +68,11 @@ class BunnyStreamProvider:
     def for_library(self, library_id):
         """Return an isolated provider instance for a selected Bunny library."""
         provider = BunnyStreamProvider()
-        provider.library_id = str(library_id or self.library_id).strip()
+        requested_id = str(library_id or self.library_id).strip()
+        allowed_ids = {str(entry.get("id")).strip() for entry in self.library_catalog}
+        if requested_id not in allowed_ids:
+            raise ValueError("Selected Bunny library is not configured")
+        provider.library_id = requested_id
         provider.api_key = provider.library_keys.get(provider.library_id) or self.library_keys.get(provider.library_id) or self.api_key
         provider.base_url = self.base_url
         provider.cdn_hostname = self.cdn_hostname
