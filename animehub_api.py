@@ -120,6 +120,30 @@ def select_links(records, quality=None, language=None):
     return links
 
 
+def quality_fallback_groups(records, quality=None, max_groups=3):
+    """Return quality groups in requested -> higher -> lower priority order."""
+    links = direct_downloads(records)
+    if not links:
+        return []
+    wanted_match = re.search(r"(\d{3,4})", str(quality or ""))
+    if not wanted_match:
+        return [links[:]]
+    wanted = int(wanted_match.group(1))
+    buckets = {}
+    for record in links:
+        match = re.search(r"(\d{3,4})", str(record.get("quality") or ""))
+        if match:
+            buckets.setdefault(int(match.group(1)), []).append(record)
+    if not buckets:
+        return [links[:]]
+    available = sorted(buckets)
+    exact = [value for value in available if value == wanted]
+    higher = [value for value in available if value > wanted]
+    lower = [value for value in available if value < wanted]
+    order = exact + sorted(higher) + sorted(lower, reverse=True)
+    return [buckets[value] for value in order[:max_groups]]
+
+
 def public_link(record):
     return {
         "provider": record.get("name"),
@@ -436,9 +460,12 @@ async def resolve_plan_item(item):
                     resolve_work_episode, title, number,
                     item.get("mal_id") or item.get("myanimelist_id"),
                 )
-                records = select_links(records, quality, language)
-                if not records:
+                if language:
+                    records = [r for r in records if str(language).lower() in str(r.get("language", "")).lower()]
+                quality_groups = quality_fallback_groups(records, quality, max_groups=3)
+                if not quality_groups:
                     raise LookupError("No direct downloadable link matched the requested filters")
+                records = [record for group in quality_groups for record in group]
                 selected_quality = records[0].get("quality") or quality or "source"
                 result = {"status": "completed", "work": target.get("name"), "episode": selected.get("order"),
                           "episode_name": selected.get("name"), "requested_quality": quality or "720p",
@@ -462,28 +489,33 @@ async def resolve_plan_item(item):
                     # Render or return an invalid media response. Try every
                     # direct source matching the requested quality before marking
                     # the episode failed.
-                    for record in records:
-                        try:
-                            async with MEDIA_TRANSFER_SEMAPHORE:
-                                stored = await asyncio.to_thread(
-                                    provider.server_download_and_upload,
-                                    record["download_url"], episode_title, quality, work_name,
-                                )
-                            result["canonical_work"] = canonical_name
-                            result["requested_title"] = title
-                            result["selected_source"] = record.get("name")
-                            result["storage"] = stored
-                            result["accepted_by_bunny"] = bool(stored.get("accepted", True))
-                            result["encoding_pending"] = bool(stored.get("encoding_pending", False))
-                            result["verified"] = result["accepted_by_bunny"]
+                    for group in quality_groups:
+                        for record in group:
+                            try:
+                                async with MEDIA_TRANSFER_SEMAPHORE:
+                                    stored = await asyncio.to_thread(
+                                        provider.server_download_and_upload,
+                                        record["download_url"], episode_title, record.get("quality") or quality, work_name,
+                                    )
+                                result["canonical_work"] = canonical_name
+                                result["requested_title"] = title
+                                result["selected_source"] = record.get("name")
+                                result["selected_quality"] = record.get("quality") or quality or "source"
+                                result["storage"] = stored
+                                result["accepted_by_bunny"] = bool(stored.get("accepted", True))
+                                result["encoding_pending"] = bool(stored.get("encoding_pending", False))
+                                result["verified"] = result["accepted_by_bunny"]
+                                break
+                            except Exception as source_exc:
+                                attempts.append({
+                                    "provider": record.get("name"),
+                                    "quality": record.get("quality"),
+                                    "url": record.get("download_url"),
+                                    "code": type(source_exc).__name__,
+                                    "message": str(source_exc),
+                                })
+                        if stored is not None:
                             break
-                        except Exception as source_exc:
-                            attempts.append({
-                                "provider": record.get("name"),
-                                "url": record.get("download_url"),
-                                "code": type(source_exc).__name__,
-                                "message": str(source_exc),
-                            })
                     if stored is None:
                         raise RuntimeError(json.dumps({
                             "message": "All matching direct sources failed",
