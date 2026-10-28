@@ -18,6 +18,7 @@ class JobManager:
         for index, item in enumerate(plan):
             items.append({"id": index + 1, "title": item.get("title", ""), "type": item.get("type", "auto"),
                           "season": item.get("season"), "episodes": item.get("episodes"),
+                          "episode_count": item.get("episode_count") or item.get("episodes_count") or item.get("count"),
                           "start_episode": item.get("start_episode"), "end_episode": item.get("end_episode"),
                           "episode_concurrency": item.get("episode_concurrency", 6),
                           "all_episodes": bool(item.get("all_episodes", False)),
