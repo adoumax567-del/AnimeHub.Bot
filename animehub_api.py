@@ -313,11 +313,8 @@ async def storage_libraries(request: Request):
 
 
 @app.get("/v1/storage/media-proxy")
-async def media_proxy(u: str = Query(...), exp: str = Query(...), sig: str = Query(...)):
-    """Signed stream proxy so Bunny Fetch can pull PixelDrain (and similar) via our host.
-
-    No admin cookie — Bunny servers call this URL. Auth is HMAC (exp+sig).
-    """
+async def media_proxy(request: Request, u: str = Query(...), exp: str = Query(...), sig: str = Query(...)):
+    """Signed stream proxy: Bunny (or preflight) pulls the direct-download URL via our host."""
     secret = (
         os.getenv("ANIMEHUB_PROXY_SECRET")
         or os.getenv("ANIMEHUB_ADMIN_SESSION_SECRET")
@@ -328,37 +325,52 @@ async def media_proxy(u: str = Query(...), exp: str = Query(...), sig: str = Que
         raise HTTPException(403, "Invalid or expired proxy signature")
     if not u.startswith("https://"):
         raise HTTPException(422, "Only HTTPS upstream URLs allowed")
-    # Block SSRF to internal networks — only allow known media hosts.
-    allowed = ("pixeldrain.com", "pd.cyou", "filemoon", "krakenfiles.com")
+    allowed = ("pixeldrain.com", "pd.cyou", "krakenfiles.com")
     host = (u.split("/")[2] if "://" in u else "").lower()
     if not any(host == a or host.endswith("." + a) for a in allowed):
-        # still allow direct .mp4 on https CDNs
         if not any(u.lower().split("?")[0].endswith(ext) for ext in (".mp4", ".mkv", ".webm", ".m4v")):
             raise HTTPException(403, f"Host not allowed for proxy: {host}")
 
-    headers = {
+    range_header = request.headers.get("range") or request.headers.get("Range")
+    upstream_headers = {
         "User-Agent": "Mozilla/5.0 AnimeHub.Bot-Proxy/1.0",
         "Accept": "*/*",
     }
-    try:
-        head = requests.get(u, stream=True, timeout=(20, 60), headers=headers, allow_redirects=True)
-        ctype = head.headers.get("Content-Type") or "video/mp4"
-        clen = head.headers.get("Content-Length")
-        head.close()
-    except Exception:
-        ctype, clen = "video/mp4", None
+    if range_header:
+        upstream_headers["Range"] = range_header
 
     def stream():
-        with requests.get(u, stream=True, timeout=(30, 1200), headers=headers, allow_redirects=True) as resp:
-            resp.raise_for_status()
+        with requests.get(
+            u, stream=True, timeout=(30, 1200),
+            headers=upstream_headers, allow_redirects=True,
+        ) as resp:
+            if resp.status_code >= 400:
+                raise RuntimeError(f"upstream HTTP {resp.status_code}")
             for chunk in resp.iter_content(1024 * 1024):
                 if chunk:
                     yield chunk
 
-    out_headers = {"Content-Type": ctype, "Cache-Control": "no-store"}
+    # Lightweight probe for headers only (abort body immediately)
+    try:
+        probe = requests.get(
+            u, stream=True, timeout=(15, 30),
+            headers={**upstream_headers, "Range": range_header or "bytes=0-0"},
+            allow_redirects=True,
+        )
+        ctype = probe.headers.get("Content-Type") or "video/mp4"
+        clen = probe.headers.get("Content-Length")
+        status = probe.status_code
+        probe.close()
+    except Exception:
+        ctype, clen, status = "video/mp4", None, 200
+
+    out_headers = {"Content-Type": ctype, "Cache-Control": "no-store", "Accept-Ranges": "bytes"}
     if clen:
         out_headers["Content-Length"] = clen
-    return StreamingResponse(stream(), media_type=ctype, headers=out_headers)
+    # 206 if client asked Range
+    media_status = 206 if range_header and status in (200, 206) else 200
+    return StreamingResponse(stream(), media_type=ctype, headers=out_headers, status_code=media_status)
+
 
 
 @app.post("/v1/storage/upload-url")
