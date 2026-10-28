@@ -156,10 +156,9 @@ class BunnyStreamProvider:
 
     def fetch_url(self, direct_url, title, collection_id=None):
         body = {"url": direct_url, "title": str(title)[:255]}
-        if collection_id:
-            body["collectionId"] = collection_id
+        params = {"collectionId": str(collection_id)} if collection_id else None
         response = requests.post(self._url("/videos/fetch"), headers={**self._headers(), "Content-Type": "application/json"},
-                                 json=body, timeout=60)
+                                 params=params, json=body, timeout=60)
         response.raise_for_status()
         return response.json()
 
@@ -169,31 +168,61 @@ class BunnyStreamProvider:
             response.raise_for_status()
 
     def remote_fetch_and_wait(self, direct_url, title, quality=None, collection_id=None):
-        """Submit a Bunny fetch and return immediately after Bunny accepts it.
+        """Submit a Bunny fetch and return when Bunny accepts it.
 
-        Bunny continues fetching/transcoding asynchronously. The API reports
-        acceptance, not encoding completion, so the next work can start at
-        once and the status can be checked later from Bunny.
+        Fetch Video returns a status object, not necessarily a video object.
+        Bunny continues fetching/transcoding asynchronously after acceptance.
         """
+        # Fetch Video does not expose enabledResolutions; encoding follows library settings.
         body = {"url": direct_url, "title": str(title)[:255]}
-        if collection_id:
-            body["collectionId"] = collection_id
-        if quality:
-            body["enabledResolutions"] = str(quality)
-        response = requests.post(
-            self._url("/videos/fetch"), headers={**self._headers(), "Content-Type": "application/json"},
-            json=body, timeout=60,
-        )
+        params = {"collectionId": str(collection_id)} if collection_id else None
+        response = None
+        for attempt in range(3):
+            response = requests.post(
+                self._url("/videos/fetch"), headers={**self._headers(), "Content-Type": "application/json"},
+                params=params, json=body, timeout=60,
+            )
+            if response.status_code != 429 or attempt == 2:
+                break
+            time.sleep(2 ** attempt)
+        if response is None:
+            raise RuntimeError("Bunny remote fetch returned no response")
         response.raise_for_status()
-        created = response.json()
-        video_id = created.get("guid") or created.get("videoId")
+        try:
+            accepted = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Bunny remote fetch returned invalid JSON") from exc
+        if not isinstance(accepted, dict):
+            raise RuntimeError("Bunny remote fetch returned an invalid response")
+        if accepted.get("success") is not True:
+            status = accepted.get("statusCode")
+            message = str(accepted.get("message") or "request rejected")[:300]
+            raise RuntimeError(f"Bunny remote fetch rejected ({status}): {message}")
+
+        # The documented response is a StatusModel and does not promise a GUID.
+        # Look up the newly created item for playback details when available,
+        # but do not treat accepted fetches as failures if listing is delayed.
+        video_id = accepted.get("guid") or accepted.get("videoId")
         if not video_id:
-            raise RuntimeError("Bunny fetch did not return a video id")
-        return {"video_id": video_id, "created": created, "fetched_directly": True,
-                "accepted": True, "encoding_pending": True,
-                "validation": {"source": "Bunny remote fetch accepted",
-                                "encodeProgress": created.get("encodeProgress")},
-                **self.playback(video_id)}
+            try:
+                video = self.find_video(title, collection_id)
+            except Exception:
+                video = None
+            if video:
+                video_id = video.get("guid") or video.get("videoId")
+
+        result = {
+            "title": str(title)[:255],
+            "fetched_directly": True,
+            "accepted": True,
+            "encoding_pending": True,
+            "validation": {"source": "Bunny remote fetch accepted",
+                           "statusCode": accepted.get("statusCode")},
+        }
+        if video_id:
+            result["video_id"] = video_id
+            result.update(self.playback(video_id))
+        return result
 
     def video(self, video_id):
         response = requests.get(self._url(f"/videos/{video_id}"), headers=self._headers(), timeout=30)
